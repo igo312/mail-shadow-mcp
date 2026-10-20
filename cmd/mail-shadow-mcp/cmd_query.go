@@ -116,7 +116,7 @@ func queryShowRecent(database *sql.DB, account, folder string, limit, offset int
 	}
 	q += " ORDER BY e.date_utc DESC LIMIT ? OFFSET ?"
 	queryArgs = append(queryArgs, limit, offset)
-	queryPrintResults(database, q, queryArgs)
+	queryPrint(queryFetch(database, q, queryArgs))
 }
 
 // buildSelectSQL returns the SELECT…FROM mail_entries e clause.
@@ -135,59 +135,83 @@ func buildSelectSQL(withBody bool) string {
 }
 
 func querySearch(database *sql.DB, query, subject, sender, recipient, account, folder, dateFrom, dateTo string, limit, offset int, withBody bool, attachments string) {
-	var conditions []string
-	var queryArgs []any
+	// assemble builds the statement for one text-match strategy: the FTS5 index by
+	// default, or the literal substring condition passed in as textCond.
+	assemble := func(textCond string, textArgs []any) (string, []any) {
+		var conditions []string
+		var queryArgs []any
 
+		if textCond != "" {
+			conditions = append(conditions, textCond)
+			queryArgs = append(queryArgs, textArgs...)
+		}
+		if subject != "" {
+			conditions = append(conditions, "e.subject LIKE ?")
+			queryArgs = append(queryArgs, "%"+subject+"%")
+		}
+		if sender != "" {
+			conditions = append(conditions, "e.sender LIKE ?")
+			queryArgs = append(queryArgs, "%"+sender+"%")
+		}
+		if recipient != "" {
+			conditions = append(conditions, "(e.recipients_to LIKE ? OR e.recipients_cc LIKE ?)")
+			queryArgs = append(queryArgs, "%"+recipient+"%", "%"+recipient+"%")
+		}
+		if account != "" {
+			conditions = append(conditions, "e.account_id = ?")
+			queryArgs = append(queryArgs, account)
+		}
+		if folder != "" {
+			conditions = append(conditions, "e.imap_folder = ?")
+			queryArgs = append(queryArgs, folder)
+		}
+		if dateFrom != "" {
+			conditions = append(conditions, "e.date_utc >= ?")
+			queryArgs = append(queryArgs, dateFrom)
+		}
+		if dateTo != "" {
+			conditions = append(conditions, "e.date_utc <= ?")
+			queryArgs = append(queryArgs, dateTo)
+		}
+		if attachments == "only" {
+			conditions = append(conditions, "EXISTS (SELECT 1 FROM mail_attachments WHERE entry_id = e.id)")
+		} else if attachments == "none" {
+			conditions = append(conditions, "NOT EXISTS (SELECT 1 FROM mail_attachments WHERE entry_id = e.id)")
+		}
+
+		where := "WHERE 1=1"
+		if len(conditions) > 0 {
+			where = "WHERE " + strings.Join(conditions, " AND ")
+		}
+
+		q := fmt.Sprintf(`%s %s ORDER BY e.date_utc DESC LIMIT ? OFFSET ?`, buildSelectSQL(withBody), where)
+		queryArgs = append(queryArgs, limit, offset)
+		return q, queryArgs
+	}
+
+	textCond := ""
+	var textArgs []any
 	if query != "" {
-		conditions = append(conditions, `e.id IN (SELECT entry_id FROM mail_content_fts WHERE mail_content_fts MATCH ?)`)
-		queryArgs = append(queryArgs, query)
-	}
-	if subject != "" {
-		conditions = append(conditions, "e.subject LIKE ?")
-		queryArgs = append(queryArgs, "%"+subject+"%")
-	}
-	if sender != "" {
-		conditions = append(conditions, "e.sender LIKE ?")
-		queryArgs = append(queryArgs, "%"+sender+"%")
-	}
-	if recipient != "" {
-		conditions = append(conditions, "(e.recipients_to LIKE ? OR e.recipients_cc LIKE ?)")
-		queryArgs = append(queryArgs, "%"+recipient+"%", "%"+recipient+"%")
-	}
-	if account != "" {
-		conditions = append(conditions, "e.account_id = ?")
-		queryArgs = append(queryArgs, account)
-	}
-	if folder != "" {
-		conditions = append(conditions, "e.imap_folder = ?")
-		queryArgs = append(queryArgs, folder)
-	}
-	if dateFrom != "" {
-		conditions = append(conditions, "e.date_utc >= ?")
-		queryArgs = append(queryArgs, dateFrom)
-	}
-	if dateTo != "" {
-		conditions = append(conditions, "e.date_utc <= ?")
-		queryArgs = append(queryArgs, dateTo)
-	}
-	if attachments == "only" {
-		conditions = append(conditions, "EXISTS (SELECT 1 FROM mail_attachments WHERE entry_id = e.id)")
-	} else if attachments == "none" {
-		conditions = append(conditions, "NOT EXISTS (SELECT 1 FROM mail_attachments WHERE entry_id = e.id)")
+		textCond = `e.id IN (SELECT entry_id FROM mail_content_fts WHERE mail_content_fts MATCH ?)`
+		textArgs = []any{query}
 	}
 
-	where := "WHERE 1=1"
-	if len(conditions) > 0 {
-		where = "WHERE " + strings.Join(conditions, " AND ")
+	q, queryArgs := assemble(textCond, textArgs)
+	results := queryFetch(database, q, queryArgs)
+
+	// FTS5 cannot segment CJK text: it indexes "关于2026年度财务结算有关事项的通知"
+	// as one term, so -q "通知" matches nothing. Retry such queries as a literal
+	// substring match over subject and body.
+	if len(results) == 0 && query != "" && db.HasCJK(query) {
+		q, queryArgs = assemble(db.SubstringMatchSQL, db.SubstringMatchArgs(query))
+		results = queryFetch(database, q, queryArgs)
 	}
 
-	base := buildSelectSQL(withBody)
-	q := fmt.Sprintf(`%s %s ORDER BY e.date_utc DESC LIMIT ? OFFSET ?`, base, where)
-	queryArgs = append(queryArgs, limit, offset)
-	queryPrintResults(database, q, queryArgs)
+	queryPrint(results)
 }
 
-func queryPrintResults(database *sql.DB, q string, args []any) {
+// queryFetch runs q and decodes every row into a queryResult.
+func queryFetch(database *sql.DB, q string, args []any) []queryResult {
 	rows, err := database.Query(q, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: query: %v\n", err)
@@ -208,7 +232,11 @@ func queryPrintResults(database *sql.DB, q string, args []any) {
 		}
 		results = append(results, r)
 	}
+	return results
+}
 
+// queryPrint writes results to stdout as an indented JSON array.
+func queryPrint(results []queryResult) {
 	if len(results) == 0 {
 		fmt.Fprintln(os.Stderr, "no results")
 		return

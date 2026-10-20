@@ -238,7 +238,7 @@ The AI agent has no direct IMAP access. It cannot expunge messages, empty folder
 - **Local shadow database** — emails are synced into a local SQLite database; the AI agent never connects to your IMAP server directly
 - **Read-only sync** — the sync engine only issues read commands (`SELECT`, `UID FETCH`); no `STORE`, `APPEND`, or `EXPUNGE` is ever sent to your mail server
 - **Incremental sync** — only fetches messages newer than the last known UID
-- **Full-text search** — SQLite FTS5 index for fast body-text queries
+- **Full-text search** — SQLite FTS5 index for fast body-text queries; queries FTS5 cannot segment (Chinese, Japanese, Korean) automatically fall back to a substring match on subject and body
 - **Multi-account** — sync any number of IMAP accounts simultaneously
 - **IMAP IDLE** — optional real-time push notifications; new mail detected within seconds instead of waiting for the next poll interval
 - **Read/replied status** — `is_read` and `is_replied` flags synced from IMAP and exposed as filters

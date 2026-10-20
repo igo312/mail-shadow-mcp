@@ -35,6 +35,7 @@ import (
 
 	"github.com/dryas/mail-shadow-mcp/internal/attachment"
 	"github.com/dryas/mail-shadow-mcp/internal/config"
+	maildb "github.com/dryas/mail-shadow-mcp/internal/db"
 	"github.com/dryas/mail-shadow-mcp/internal/fileserver"
 	imapsync "github.com/dryas/mail-shadow-mcp/internal/sync"
 )
@@ -587,6 +588,17 @@ func parseSearchParams(req mcp.CallToolRequest) searchParams {
 }
 
 func buildSearchQuery(p searchParams, cfg *config.Config) *queryBuilder {
+	return buildSearchQueryMode(p, cfg, false)
+}
+
+// buildSubstringSearchQuery builds the same query as buildSearchQuery, but
+// matches p.query as a literal substring of the subject or body instead of
+// going through the FTS5 index. See handleSearchEmails for why it exists.
+func buildSubstringSearchQuery(p searchParams, cfg *config.Config) *queryBuilder {
+	return buildSearchQueryMode(p, cfg, true)
+}
+
+func buildSearchQueryMode(p searchParams, cfg *config.Config, substring bool) *queryBuilder {
 	bodyExpr := `''`
 	if p.includeBody {
 		bodyExpr = `COALESCE((SELECT body_text FROM mail_content WHERE entry_id = e.id), '')`
@@ -595,14 +607,21 @@ func buildSearchQuery(p searchParams, cfg *config.Config) *queryBuilder {
 
 	qb := &queryBuilder{}
 	if p.query != "" {
-		qb.write(selectClause + `
+		if substring {
+			qb.write(selectClause + `
+		FROM mail_entries e
+		WHERE ` + maildb.SubstringMatchSQL)
+			qb.args = append(qb.args, maildb.SubstringMatchArgs(p.query)...)
+		} else {
+			qb.write(selectClause + `
 		FROM mail_entries e
 		WHERE e.id IN (SELECT entry_id FROM mail_content_fts WHERE mail_content_fts MATCH ?)`)
-		// Wrap the user query in FTS5 phrase quotes so that special characters
-		// like ":", "-", "*", "(" etc. are treated as literals and not as FTS5
-		// query syntax (e.g. "Re:" would otherwise be parsed as column "Re").
-		// Any embedded double-quote must be doubled per FTS5 escaping rules.
-		qb.args = append(qb.args, `"`+strings.ReplaceAll(p.query, `"`, `""`)+`"`)
+			// Wrap the user query in FTS5 phrase quotes so that special characters
+			// like ":", "-", "*", "(" etc. are treated as literals and not as FTS5
+			// query syntax (e.g. "Re:" would otherwise be parsed as column "Re").
+			// Any embedded double-quote must be doubled per FTS5 escaping rules.
+			qb.args = append(qb.args, `"`+strings.ReplaceAll(p.query, `"`, `""`)+`"`)
+		}
 	} else {
 		qb.write(selectClause + ` FROM mail_entries e WHERE 1=1`)
 	}
@@ -683,56 +702,24 @@ func handleSearchEmails(db *sql.DB, cfg *config.Config) server.ToolHandlerFunc {
 			return mcp.NewToolResultError(msg), nil
 		}
 		qb := buildSearchQuery(p, cfg)
-
-		rows, err := db.QueryContext(ctx, qb.sql(), qb.args...)
+		results, total, err := runSearchQuery(ctx, db, qb)
 		if err != nil {
 			return mcp.NewToolResultError(fmtDBError(err)), nil
 		}
-		defer rows.Close()
 
-		type searchResult struct {
-			mailSummary
-			BodyText string `json:"body_text,omitempty"`
-		}
-
-		var results []searchResult
-		for rows.Next() {
-			var m searchResult
-			var rawDateStr sql.NullString
-			var rawIsRead, rawIsReplied sql.NullInt64
-			var attJSON string
-			if err := rows.Scan(&m.ID, &m.AccountID, &m.Folder, &m.Subject, &m.Sender, &m.RecipientsTo, &rawDateStr, &rawIsRead, &rawIsReplied, &attJSON, &m.BodyText); err != nil {
-				slog.Warn("search_emails: row scan failed", "err", err)
-				continue
+		// FTS5's tokenizer turns a run of CJK characters into a single term, so a
+		// keyword like "通知" never matches a subject like "关于…的通知". When such
+		// a query finds nothing at all, retry it as a literal substring scan.
+		if total == 0 && p.query != "" && maildb.HasCJK(p.query) {
+			fallback := buildSubstringSearchQuery(p, cfg)
+			results, total, err = runSearchQuery(ctx, db, fallback)
+			if err != nil {
+				return mcp.NewToolResultError(fmtDBError(err)), nil
 			}
-			if rawDateStr.Valid && rawDateStr.String != "" {
-				m.DateUTC = &rawDateStr.String
-			}
-			if rawIsRead.Valid {
-				v := rawIsRead.Int64 != 0
-				m.IsRead = &v
-			}
-			if rawIsReplied.Valid {
-				v := rawIsReplied.Int64 != 0
-				m.IsReplied = &v
-			}
-			if err := json.Unmarshal([]byte(attJSON), &m.Attachments); err != nil {
-				m.Attachments = []attachmentDetail{}
-			}
-			results = append(results, m)
-		}
-		if err := rows.Err(); err != nil {
-			slog.Warn("search_emails: row iteration error", "err", err)
+			slog.Info("search_emails: no FTS5 match, used substring fallback",
+				"query", p.query, "total", total)
 		}
 
-		var total int
-		countQB := qb.toCountQuery()
-		if err := db.QueryRowContext(ctx, countQB.sql(), countQB.args...).Scan(&total); err != nil {
-			slog.Warn("search_emails: count query failed", "err", err)
-		}
-		if results == nil {
-			results = []searchResult{}
-		}
 		out, _ := json.MarshalIndent(pagedResult[searchResult]{
 			TotalCount: total,
 			Offset:     p.offset,
@@ -741,6 +728,62 @@ func handleSearchEmails(db *sql.DB, cfg *config.Config) server.ToolHandlerFunc {
 		}, "", "  ")
 		return mcp.NewToolResultText(string(out)), nil
 	}
+}
+
+// searchResult is one hit returned by the search_emails tool.
+type searchResult struct {
+	mailSummary
+	BodyText string `json:"body_text,omitempty"`
+}
+
+// runSearchQuery executes qb and returns the requested page of results together
+// with the total number of matching rows (ignoring limit and offset).
+func runSearchQuery(ctx context.Context, db *sql.DB, qb *queryBuilder) ([]searchResult, int, error) {
+	rows, err := db.QueryContext(ctx, qb.sql(), qb.args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var results []searchResult
+	for rows.Next() {
+		var m searchResult
+		var rawDateStr sql.NullString
+		var rawIsRead, rawIsReplied sql.NullInt64
+		var attJSON string
+		if err := rows.Scan(&m.ID, &m.AccountID, &m.Folder, &m.Subject, &m.Sender, &m.RecipientsTo, &rawDateStr, &rawIsRead, &rawIsReplied, &attJSON, &m.BodyText); err != nil {
+			slog.Warn("search_emails: row scan failed", "err", err)
+			continue
+		}
+		if rawDateStr.Valid && rawDateStr.String != "" {
+			m.DateUTC = &rawDateStr.String
+		}
+		if rawIsRead.Valid {
+			v := rawIsRead.Int64 != 0
+			m.IsRead = &v
+		}
+		if rawIsReplied.Valid {
+			v := rawIsReplied.Int64 != 0
+			m.IsReplied = &v
+		}
+		if err := json.Unmarshal([]byte(attJSON), &m.Attachments); err != nil {
+			m.Attachments = []attachmentDetail{}
+		}
+		results = append(results, m)
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("search_emails: row iteration error", "err", err)
+	}
+
+	var total int
+	countQB := qb.toCountQuery()
+	if err := db.QueryRowContext(ctx, countQB.sql(), countQB.args...).Scan(&total); err != nil {
+		slog.Warn("search_emails: count query failed", "err", err)
+	}
+	if results == nil {
+		results = []searchResult{}
+	}
+	return results, total, nil
 }
 
 // ---------------------------------------------------------------------------

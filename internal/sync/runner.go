@@ -10,7 +10,6 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
-	"github.com/emersion/go-sasl"
 
 	"github.com/dryas/mail-shadow-mcp/internal/config"
 )
@@ -335,8 +334,7 @@ func newIdleClient(accCfg config.AccountConfig, existsCh chan<- struct{}) (*imap
 		return nil, fmt.Errorf("idle: dial %s: %w", addr, err)
 	}
 
-	saslClient := sasl.NewPlainClient("", accCfg.Username, accCfg.Password)
-	if err := c.Authenticate(saslClient); err != nil {
+	if err := authenticate(c, accCfg.Username, accCfg.Password); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("idle: authenticate %s: %w", accCfg.Username, err)
 	}

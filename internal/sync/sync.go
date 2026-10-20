@@ -31,7 +31,6 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
-	"github.com/emersion/go-sasl"
 
 	"github.com/dryas/mail-shadow-mcp/internal/config"
 )
@@ -72,8 +71,7 @@ func NewClient(cfg config.AccountConfig) (*Client, error) {
 		return nil, fmt.Errorf("sync: dial %s: %w", addr, err)
 	}
 
-	saslClient := sasl.NewPlainClient("", cfg.Username, cfg.Password)
-	if err := c.Authenticate(saslClient); err != nil {
+	if err := authenticate(c, cfg.Username, cfg.Password); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("sync: authenticate %s: %w", cfg.Username, err)
 	}

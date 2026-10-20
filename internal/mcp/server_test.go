@@ -194,6 +194,82 @@ func TestHandleSearchEmails_FullText(t *testing.T) {
 	}
 }
 
+func TestHandleSearchEmails_CJKSubstringFallback(t *testing.T) {
+	database := openTestDB(t)
+	const subject = "关于2026年度财务结算有关事项的通知"
+	const body = "请各部门于月底前完成结算工作"
+	seedEntry(t, database, "acc1:INBOX:1", "acc1", "INBOX", subject, "finance@example.com", 1)
+	seedEntry(t, database, "acc1:INBOX:2", "acc1", "INBOX", "Weekly report", "boss@example.com", 2)
+	if _, err := database.Exec(`INSERT INTO mail_content_fts (entry_id, subject, body_text) VALUES (?,?,?)`,
+		"acc1:INBOX:1", subject, body); err != nil {
+		t.Fatalf("insert fts: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO mail_content (entry_id, body_text) VALUES (?,?)`,
+		"acc1:INBOX:1", body); err != nil {
+		t.Fatalf("insert content: %v", err)
+	}
+	h := handleSearchEmails(database, &config.Config{})
+
+	// FTS5 alone cannot match a substring of a Chinese character run, so this hit
+	// only appears through the substring fallback.
+	out := callTool(t, h, map[string]any{"query": "通知"})
+	var page pagedResult[mailSummary]
+	if err := json.Unmarshal([]byte(out), &page); err != nil {
+		t.Fatalf("JSON parse: %v\nraw: %s", err, out)
+	}
+	if len(page.Results) != 1 || page.Results[0].ID != "acc1:INBOX:1" {
+		t.Fatalf("expected 1 CJK hit, got %d: %+v", len(page.Results), page.Results)
+	}
+	if page.TotalCount != 1 {
+		t.Errorf("expected total_count 1, got %d", page.TotalCount)
+	}
+
+	// A body-only keyword works through the same fallback.
+	out = callTool(t, h, map[string]any{"query": "结算工作"})
+	page = pagedResult[mailSummary]{}
+	if err := json.Unmarshal([]byte(out), &page); err != nil {
+		t.Fatalf("JSON parse: %v\nraw: %s", err, out)
+	}
+	if len(page.Results) != 1 {
+		t.Errorf("expected 1 body match, got %d", len(page.Results))
+	}
+}
+
+func TestHandleSearchEmails_CJKNoMatch(t *testing.T) {
+	database := openTestDB(t)
+	seedEntry(t, database, "acc1:INBOX:1", "acc1", "INBOX", "Invoice Q4", "billing@example.com", 1)
+	h := handleSearchEmails(database, &config.Config{})
+
+	out := callTool(t, h, map[string]any{"query": "测试"})
+	var page pagedResult[mailSummary]
+	if err := json.Unmarshal([]byte(out), &page); err != nil {
+		t.Fatalf("JSON parse: %v\nraw: %s", err, out)
+	}
+	if len(page.Results) != 0 || page.TotalCount != 0 {
+		t.Errorf("expected no results, got %d (total %d)", len(page.Results), page.TotalCount)
+	}
+}
+
+func TestHandleSearchEmails_CJKFallbackKeepsFilters(t *testing.T) {
+	database := openTestDB(t)
+	seedEntry(t, database, "acc1:INBOX:1", "acc1", "INBOX", "关于放假的通知", "hr@example.com", 1)
+	seedEntry(t, database, "acc1:INBOX:2", "acc1", "INBOX", "关于报名的通知", "hr@example.com", 2)
+	seedEntry(t, database, "acc1:Archive:3", "acc1", "Archive", "关于报销的通知", "hr@example.com", 3)
+	h := handleSearchEmails(database, &config.Config{})
+
+	out := callTool(t, h, map[string]any{"query": "通知", "folder": "Archive"})
+	var page pagedResult[mailSummary]
+	if err := json.Unmarshal([]byte(out), &page); err != nil {
+		t.Fatalf("JSON parse: %v\nraw: %s", err, out)
+	}
+	if len(page.Results) != 1 || page.Results[0].ID != "acc1:Archive:3" {
+		t.Fatalf("expected only the Archive hit, got %d: %+v", len(page.Results), page.Results)
+	}
+	if page.TotalCount != 1 {
+		t.Errorf("expected total_count 1, got %d", page.TotalCount)
+	}
+}
+
 func TestHandleSearchEmails_NoQuery_SenderFilter(t *testing.T) {
 	database := openTestDB(t)
 	seedEntry(t, database, "acc1:INBOX:1", "acc1", "INBOX", "Msg A", "alice@example.com", 1)
