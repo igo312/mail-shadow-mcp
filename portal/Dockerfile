@@ -5,7 +5,7 @@
 # process with the Docker socket is effectively root on the host.  Read
 # portal/README.md before exposing this to the internet.
 
-FROM python:3.14-alpine
+FROM python:3.12-alpine
 
 RUN apk add --no-cache ca-certificates tzdata docker-cli
 

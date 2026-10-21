@@ -198,7 +198,8 @@ Python 进程**不需要**放进 Docker。可以二选一：
 
 前提：
 
-- Python 3.14；
+- Python 3.10+（推荐 3.12；3.10 / 3.12 / 3.14 都跑通了全部测试）；
+- **不需要 `pip install`**：portal 只用 Python 标准库（`http.server`、`sqlite3`、`imaplib`、`hmac`、`subprocess`），没有 `requirements.txt`；
 - 已安装 Docker Engine / Docker Desktop，`docker` 命令可用；
 - 当前用户能访问 Docker socket（Linux 上通常在 `docker` 组，Windows 上 Docker Desktop 默认可用）。
 
@@ -259,11 +260,41 @@ mcp.example.com {
 python cli.py invite create --label "alice" --uses 1 --days 7
 ```
 
+#### 用 supervisor 守护（Linux）
+
+仓库带了一份 supervisor 配置模板：
+
+```bash
+sudo cp deploy/msm-portal.supervisor.conf /etc/supervisor/conf.d/msm-portal.conf
+sudo editor /etc/supervisor/conf.d/msm-portal.conf
+sudo mkdir -p /var/lib/msm-portal
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl status msm-portal
+```
+
+需要改的几项：
+
+- `command` 指向你的 Python 3.12，例如 `/usr/bin/python3.12`（用 `pyenv`/venv 时写绝对路径）；
+- `directory` 指向仓库里的 `portal/`；
+- `MSM_DATA_DIR`、`MSM_PUBLIC_URL`、`MSM_LISTEN_PORT` 换成实际值；
+- 用 `http://` 时 `MSM_SECURE_COOKIES="0"`，用 `https://` 时改成 `"1"`；
+- 如果前面有 Caddy/Nginx，把 `MSM_LISTEN_HOST` 改成 `127.0.0.1` 并加 `MSM_TRUST_PROXY="1"`；
+- 不想用 root 时设置 `user=`/`group=`，该用户需在 `docker` 组且能写 `MSM_DATA_DIR`。
+
+supervisor 不会展开 shell 变量，模板里的值必须直接写死。日志在 `/var/log/msm-portal.log`：
+
+```bash
+sudo tail -f /var/log/msm-portal.log
+```
+
+> supervisor 只守护 portal 进程；已经启动的 `msm-<id>` 容器由各自的 Docker restart 策略管理，portal 重启不会影响它们。
+
 > `MSM_BACKEND_MODE=ip` 是 Linux 宿主机直连 Docker bridge IP 的另一种方式，但 Docker Desktop（Windows/macOS）通常不可靠；优先用 `port`。
 >
 > 如果 `docker` 不在 PATH，设置 `MSM_DOCKER_BIN` 指向 `docker.exe` / `docker` 的绝对路径。
 >
-> 生产环境请用 systemd、NSSM 或任务计划程序守护 `python -m app`，让它随机器启动；portal 重启不会停止已经运行的实例容器。
+> 生产环境请用 supervisor（见上）、systemd、NSSM 或任务计划程序守护 `python -m app`，让它随机器启动；portal 重启不会停止已经运行的实例容器。
 >
 > `MSM_BACKEND_MODE=network` 只适用于 portal 容器和实例容器在同一个 Docker 网络里的 compose 部署。
 
@@ -496,8 +527,10 @@ portal/
 │   ├── web.py             # HTTP 路由与页面
 │   ├── templates.py       # 服务端 HTML
 │   └── static/            # CSS / JS
-├── tests/                 # 单元/集成测试（60+）
+├── tests/                 # 单元/集成测试（70 个）
 ├── cli.py                 # 管理命令
+├── deploy/
+│   └── msm-portal.supervisor.conf  # supervisor 配置模板
 ├── Dockerfile
 ├── docker-compose.yml
 ├── Caddyfile
