@@ -255,6 +255,27 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(self.provisioner.calls, [])
 
+    def test_origin_null_is_accepted(self) -> None:
+        # Embedded webviews / sandboxed previews send an opaque origin.
+        self._make_invite()
+        status, headers, _ = self.client.post_form(
+            "/invite",
+            {"invite": "msm_test_code"},
+            headers={"Origin": "null"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["location"], "/provision")
+
+    def test_origin_null_cross_site_is_rejected(self) -> None:
+        invite_id = self._make_invite()
+        status, _, _ = self.client.post_form(
+            "/invite",
+            {"invite": "msm_test_code"},
+            headers={"Origin": "null", "Sec-Fetch-Site": "cross-site"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(self.db.get_invite(invite_id)["uses"], 0)
+
     def test_session_required(self) -> None:
         status, headers, _ = self.client.get("/provision")
         self.assertEqual(status, 303)

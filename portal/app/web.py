@@ -202,7 +202,7 @@ class WebApp:
             )
             return
         if not self._origin_ok(handler):
-            self._html(handler, 403, templates.invite_page(error="请求来源无效。"))
+            self._html(handler, 403, templates.invite_page(error="请求来源无效，请用浏览器直接打开本页后重试。"))
             return
         try:
             form = _read_form(handler)
@@ -265,7 +265,7 @@ class WebApp:
             )
             return
         if not self._origin_ok(handler):
-            self._render_provision_error(handler, session, cookie, "请求来源无效。", 403)
+            self._render_provision_error(handler, session, cookie, "请求来源无效，请用浏览器直接打开本页后重试。", 403)
             return
         try:
             form = _read_form(handler)
@@ -457,12 +457,19 @@ class WebApp:
         return session, cookie
 
     def _origin_ok(self, handler: BaseHTTPRequestHandler) -> bool:
-        origin = handler.headers.get("Origin")
-        if origin and origin.rstrip("/") != self.config.public_origin:
-            return False
+        # Sec-Fetch-Site is authoritative when the client sends it: a
+        # cross-site form post must never be accepted.
         fetch_site = (handler.headers.get("Sec-Fetch-Site") or "").lower()
         if fetch_site == "cross-site":
             return False
+        origin = handler.headers.get("Origin")
+        # Embedded webviews, sandboxed previews and some privacy browsers
+        # send an opaque origin ("null") for a same-origin form post.  Treat
+        # it like a missing Origin instead of rejecting a valid request; the
+        # session cookie is SameSite=Lax and framing is denied, so allowing
+        # it does not enable cross-site state changes.
+        if origin and origin.strip().lower() != "null":
+            return origin.rstrip("/") == self.config.public_origin
         return True
 
     def _token_matches(self, instance: dict[str, Any], token: str) -> bool:
