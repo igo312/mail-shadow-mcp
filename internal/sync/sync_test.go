@@ -179,23 +179,80 @@ func TestFormatAddresses(t *testing.T) {
 // Step 5 — body text & attachments
 // ---------------------------------------------------------------------------
 
-func TestExtractBodyText_Found(t *testing.T) {
+func TestExtractTextFromSections_Decodes(t *testing.T) {
 	section := &imap.FetchItemBodySection{Specifier: imap.PartSpecifierText, Peek: true}
+	bs := &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Encoding: "7BIT"}
 	msg := &imapclient.FetchMessageBuffer{
 		BodySection: []imapclient.FetchBodySectionBuffer{
 			{Section: section, Bytes: []byte("  Hello world  ")},
 		},
 	}
-	got := extractBodyText(msg)
-	if got != "Hello world" {
+	if got := extractTextFromSections(bs, msg); got != "Hello world" {
 		t.Errorf("want %q, got %q", "Hello world", got)
 	}
 }
 
-func TestExtractBodyText_Missing(t *testing.T) {
-	msg := &imapclient.FetchMessageBuffer{}
-	if got := extractBodyText(msg); got != "" {
+func TestExtractTextFromSections_Missing(t *testing.T) {
+	if got := extractTextFromSections(nil, &imapclient.FetchMessageBuffer{}); got != "" {
 		t.Errorf("expected empty string, got %q", got)
+	}
+}
+
+// A multipart mail with a text part and a PDF attachment must only ask for the
+// text part: the attachment payload is what made one folder take hours.
+func TestTextSections_SkipsAttachments(t *testing.T) {
+	pdf := &imap.BodyStructureSinglePart{
+		Type: "application", Subtype: "pdf", Size: 14 << 20,
+		Extended: &imap.BodyStructureSinglePartExt{
+			Disposition: &imap.BodyStructureDisposition{
+				Value:  "attachment",
+				Params: map[string]string{"filename": "report.pdf"},
+			},
+		},
+	}
+	bs := &imap.BodyStructureMultiPart{
+		Children: []imap.BodyStructure{
+			&imap.BodyStructureMultiPart{
+				Children: []imap.BodyStructure{
+					&imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Encoding: "base64"},
+					&imap.BodyStructureSinglePart{Type: "text", Subtype: "html", Encoding: "base64"},
+				},
+				Subtype: "alternative",
+			},
+			pdf,
+		},
+		Subtype: "mixed",
+	}
+
+	sections := textSections(bs)
+	if len(sections) != 1 {
+		t.Fatalf("expected exactly the text/plain part, got %d section(s)", len(sections))
+	}
+	if got := sections[0].Part; len(got) != 2 || got[0] != 1 || got[1] != 1 {
+		t.Errorf("part path: want [1 1], got %v", got)
+	}
+	if !sections[0].Peek {
+		t.Error("body section must be fetched with PEEK so the mailbox is not modified")
+	}
+}
+
+// A single-part PDF mail has no readable text: fetching BODY[TEXT] there would
+// download the whole attachment for nothing.
+func TestTextSections_SinglePartAttachmentIsSkipped(t *testing.T) {
+	bs := &imap.BodyStructureSinglePart{Type: "application", Subtype: "pdf", Size: 14 << 20}
+	if sections := textSections(bs); len(sections) != 0 {
+		t.Errorf("expected no sections for an attachment-only mail, got %d", len(sections))
+	}
+}
+
+func TestTextSections_SinglePartText(t *testing.T) {
+	bs := &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Encoding: "quoted-printable"}
+	sections := textSections(bs)
+	if len(sections) != 1 {
+		t.Fatalf("expected 1 section, got %d", len(sections))
+	}
+	if sections[0].Specifier != imap.PartSpecifierText {
+		t.Errorf("single-part body must be fetched as BODY[TEXT], got %q", sections[0].Specifier)
 	}
 }
 

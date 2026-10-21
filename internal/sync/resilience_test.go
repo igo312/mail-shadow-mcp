@@ -166,7 +166,8 @@ func TestImportMessageBatch_ZeroExpectedDoesNotPanic(t *testing.T) {
 	}
 
 	// expected == 0 used to divide by zero in the progress log.
-	if err := client.importMessageBatch(database, testLogger(), "INBOX", []*imapclient.FetchMessageBuffer{msg}, 0, 0); err != nil {
+	texts := map[uint32]string{5: "body text"}
+	if err := client.importMessageBatch(database, testLogger(), "INBOX", []*imapclient.FetchMessageBuffer{msg}, texts, 0, 0); err != nil {
 		t.Fatalf("importMessageBatch: %v", err)
 	}
 

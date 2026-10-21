@@ -44,8 +44,14 @@ type poisonServer struct {
 	subjects  map[uint32]string
 	bodies    map[uint32][]byte
 
-	mu    sync.Mutex
-	conns int
+	// structures overrides the default single-part BODYSTRUCTURE per UID.
+	structures map[uint32]string
+	// parts holds the payload returned for a numbered body part ("1", "1.1", …).
+	parts map[uint32]map[string][]byte
+
+	mu       sync.Mutex
+	conns    int
+	requests []string
 }
 
 func newPoisonServer(t *testing.T, poisonUID uint32, subjects map[uint32]string, bodies map[uint32][]byte) *poisonServer {
@@ -57,14 +63,25 @@ func newPoisonServer(t *testing.T, poisonUID uint32, subjects map[uint32]string,
 	}
 
 	s := &poisonServer{
-		ln:        ln,
-		poisonUID: poisonUID,
-		subjects:  subjects,
-		bodies:    bodies,
+		ln:         ln,
+		poisonUID:  poisonUID,
+		subjects:   subjects,
+		bodies:     bodies,
+		structures: map[uint32]string{},
+		parts:      map[uint32]map[string][]byte{},
 	}
 	go s.serve()
 	t.Cleanup(func() { ln.Close() })
 	return s
+}
+
+// fetchRequests returns every FETCH data item list the server received.
+func (s *poisonServer) fetchRequests() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.requests))
+	copy(out, s.requests)
+	return out
 }
 
 func (s *poisonServer) port() int {
@@ -178,13 +195,17 @@ func (s *poisonServer) writeFetch(writer *bufio.Writer, args string) bool {
 	uidSet := rest[:space]
 	items := rest[space+1:]
 
-	wantBodyText := strings.Contains(items, "BODY.PEEK[TEXT]") || strings.Contains(items, "BODY[TEXT]")
+	s.mu.Lock()
+	s.requests = append(s.requests, items)
+	s.mu.Unlock()
+
 	wantWholeMessage := strings.Contains(items, "BODY.PEEK[]") || strings.Contains(items, "BODY[]")
 	wantBodyStructure := strings.Contains(items, "BODYSTRUCTURE")
 	wantEnvelope := strings.Contains(items, "ENVELOPE")
 	wantFlags := strings.Contains(items, "FLAGS")
 	wantInternalDate := strings.Contains(items, "INTERNALDATE")
 	wantSize := strings.Contains(items, "RFC822.SIZE")
+	sections := bodySections(items)
 
 	for _, uid := range parseUIDSet(uidSet) {
 		if _, ok := s.subjects[uid]; !ok {
@@ -213,22 +234,28 @@ func (s *poisonServer) writeFetch(writer *bufio.Writer, args string) bool {
 				fmt.Fprint(writer, ` BODYSTRUCTURE ("TEXT" NIL ("CHARSET" "utf-8") NIL NIL "7BIT" 20 1)`)
 				return false
 			}
-			fmt.Fprintf(writer, ` BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" %d 1)`,
-				len(s.bodies[uid]))
+			if st, ok := s.structures[uid]; ok {
+				fmt.Fprintf(writer, " BODYSTRUCTURE %s", st)
+			} else {
+				fmt.Fprintf(writer, ` BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" %d 1)`,
+					len(s.bodies[uid]))
+			}
 		}
 
 		switch {
 		case wantWholeMessage:
-			body := s.bodies[uid]
-			fmt.Fprintf(writer, " BODY[] {%d}\r\n", len(body))
-			if _, err := writer.Write(body); err != nil {
+			if !writeLiteral(writer, "BODY[]", s.bodies[uid]) {
 				return false
 			}
-		case wantBodyText:
-			body := s.bodies[uid]
-			fmt.Fprintf(writer, " BODY[TEXT] {%d}\r\n", len(body))
-			if _, err := writer.Write(body); err != nil {
-				return false
+		default:
+			for _, label := range sections {
+				payload, ok := s.bodyPayload(uid, label)
+				if !ok {
+					continue
+				}
+				if !writeLiteral(writer, "BODY["+label+"]", payload) {
+					return false
+				}
 			}
 		}
 
@@ -236,6 +263,55 @@ func (s *poisonServer) writeFetch(writer *bufio.Writer, args string) bool {
 	}
 
 	return true
+}
+
+// bodyPayload resolves the bytes for one BODY[...] label.
+func (s *poisonServer) bodyPayload(uid uint32, label string) ([]byte, bool) {
+	if label == "" || label == "TEXT" {
+		body, ok := s.bodies[uid]
+		return body, ok
+	}
+	if parts, ok := s.parts[uid]; ok {
+		if payload, ok := parts[label]; ok {
+			return payload, true
+		}
+	}
+	return nil, false
+}
+
+// writeLiteral emits one literal item: ` BODY[x] {n}\r\n<payload>`.
+func writeLiteral(writer *bufio.Writer, item string, payload []byte) bool {
+	fmt.Fprintf(writer, " %s {%d}\r\n", item, len(payload))
+	_, err := writer.Write(payload)
+	return err == nil
+}
+
+// bodySections extracts the labels of every BODY[...] item in a FETCH list.
+func bodySections(items string) []string {
+	var out []string
+	rest := items
+	for {
+		idx := strings.Index(rest, "BODY[")
+		peekIdx := strings.Index(rest, "BODY.PEEK[")
+		if peekIdx >= 0 && (idx < 0 || peekIdx < idx) {
+			idx = peekIdx
+		}
+		if idx < 0 {
+			return out
+		}
+		open := strings.IndexByte(rest[idx:], '[')
+		if open < 0 {
+			return out
+		}
+		open += idx
+		closeIdx := strings.IndexByte(rest[open:], ']')
+		if closeIdx < 0 {
+			return out
+		}
+		end := open + closeIdx
+		out = append(out, rest[open+1:end])
+		rest = rest[end+1:]
+	}
 }
 
 func splitCommand(line string) (tag, command, args string) {

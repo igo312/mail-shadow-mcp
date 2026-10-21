@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
   <img src="img/logo.png" alt="mail-shadow-mcp logo" width="200" />
 </div>
 
@@ -50,6 +50,8 @@ Most AI agents require direct access to your email (IMAP) to "see" your messages
 The recommended way to run mail-shadow-mcp is via **Docker**. Running it in a container keeps the sync engine, credentials, and database fully isolated from your AI agent, which connects over HTTP. The agent never has access to the host filesystem or your IMAP password — only to the MCP API.
 
 If you prefer to run it locally without Docker, you can download a pre-compiled binary from the [Releases page](https://github.com/dryas/mail-shadow-mcp/releases) and use `stdio` transport instead. However, this means the agent process and mail-shadow-mcp share the same user context, which reduces the isolation benefits described above.
+
+> **Hosting it for several people?** The [`portal/`](portal/README.md) directory contains an invite-only provisioning service: users enter an invite code and their mailbox app password, and the portal starts an isolated container per mailbox. The Python process can run directly on the host (`MSM_BACKEND_MODE=port`) or in Docker. All MCP clients share one public port and are separated by per-instance Bearer tokens — no per-user public ports.
 
 ### Step 1 — Start the container to generate the example config
 
@@ -397,6 +399,34 @@ ORDER BY imap_folder, imap_uid;
 A row that keeps growing `attempts` is a message the server consistently sends
 in an unusable form; `reason` says which part failed. Nothing is dropped
 silently — the row stays until the message can be parsed.
+
+### Only Text Is Downloaded, Attachments Stay on the Server
+
+`BODY[TEXT]` sounds like "the text part" but in IMAP it is *everything after the
+top-level headers* — every attachment included. Fetching it for a whole mailbox
+is ruinous on accounts with scanned documents: one measured folder of 165 ship
+reports was 560 MB, of which the readable text was 0.2%. Large windows also tend
+to exceed the server's per-command time limit, which shows up as a connection
+that closes mid-`FETCH`.
+
+The sync therefore runs two phases:
+
+1. **Metadata** — `UID FETCH (UID ENVELOPE FLAGS INTERNALDATE BODYSTRUCTURE)`.
+   Nothing but structure crosses the wire, so the cost per message is a few
+   hundred bytes.
+2. **Text** — the `text/plain` parts selected from that structure, fetched with
+   `BODY.PEEK[n]` and grouped so messages needing the same part share one
+   command. HTML-only and attachment-only mail contributes no body at all
+   instead of a payload.
+
+Attachment *metadata* (filename, MIME type, size) is still read from
+`BODYSTRUCTURE` and stored in `mail_attachments`, so `download_attachments` and
+`get_download_link` keep working — the bytes are fetched from IMAP only when one
+of those tools is called.
+
+A sync that stops delivering anything for 60 s is treated as a dead connection
+rather than waiting forever: the socket is closed and the window is retried and,
+if needed, bisected like any other failure.
 
 ### Attachment Download Server
 

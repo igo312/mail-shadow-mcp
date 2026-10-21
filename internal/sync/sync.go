@@ -41,11 +41,11 @@ import (
 	"io"
 	"log/slog"
 	"math"
-	"mime"
-	"mime/multipart"
 	"mime/quotedprintable"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -68,6 +68,12 @@ const (
 	// rawMessageLimit caps the size of a message fetched as a single literal in
 	// the fallback path. Bigger messages are quarantined instead of buffered.
 	rawMessageLimit = 32 << 20
+
+	// fetchStallTimeout is how long a FETCH may go without delivering anything
+	// before the connection is considered dead. Some servers accept a command
+	// and then answer nothing at all (they close the socket minutes later);
+	// go-imap has no read deadline, so without this the sync waits forever.
+	fetchStallTimeout = 60 * time.Second
 )
 
 // Client wraps an authenticated IMAP connection for a single account.
@@ -266,13 +272,26 @@ func (c *Client) importWindows(db *sql.DB, logger *slog.Logger, folder string, p
 		}
 		window := pending[start:end]
 
-		msgs, bad, ferr := c.fetchResilient(folder, window, structuredFetchOptions())
+		msgs, bad, ferr := c.fetchResilient(folder, window, metaFetchOptions())
 		if ferr != nil {
 			return imported, skipped, fmt.Errorf("sync: fetch uid %d..%d: %w", window[0], window[len(window)-1], ferr)
 		}
 
+		// Second phase: only the readable text of each message, never the
+		// attachment payloads. A message whose text cannot be fetched is left to
+		// the raw fallback below rather than imported with an empty body.
+		texts, badBody, terr := c.fetchTextBodies(folder, msgs)
+		if terr != nil {
+			return imported, skipped, fmt.Errorf("sync: fetch body text uid %d..%d: %w",
+				window[0], window[len(window)-1], terr)
+		}
+		bad = append(bad, badBody...)
+		if len(badBody) > 0 {
+			msgs = withoutUIDs(msgs, badBody)
+		}
+
 		if len(msgs) > 0 {
-			if serr := c.importMessageBatch(db, logger, folder, msgs, done, expected); serr != nil {
+			if serr := c.importMessageBatch(db, logger, folder, msgs, texts, done, expected); serr != nil {
 				return imported, skipped, serr
 			}
 			imported += len(msgs)
@@ -306,19 +325,84 @@ func (c *Client) importWindows(db *sql.DB, logger *slog.Logger, folder string, p
 	return imported, skipped, nil
 }
 
-// structuredFetchOptions is the regular, compact fetch: metadata plus the
-// text/plain body, without transferring attachment payloads.
-func structuredFetchOptions() *imap.FetchOptions {
+// metaFetchOptions is the first of the two fetch phases: message metadata only,
+// no body payload.
+//
+// BODY[TEXT] looks like "the text part" but is actually everything after the
+// top-level headers, so it drags every attachment across the wire. One ship
+// folder measured here was 165 messages / 560 MB of mostly PDFs whose readable
+// text was 0.2% of the payload — and a 100-message window of that size exceeds
+// the server's ~5 minute per-command limit, which is what made the whole sync
+// crawl. Bodies are therefore fetched separately, part by part, in
+// fetchTextBodies.
+func metaFetchOptions() *imap.FetchOptions {
 	return &imap.FetchOptions{
 		UID:           true,
 		Envelope:      true,
 		InternalDate:  true,
 		Flags:         true,
 		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
-		BodySection: []*imap.FetchItemBodySection{
-			{Specifier: imap.PartSpecifierText, Peek: true},
-		},
 	}
+}
+
+// textSections lists the body sections that hold a message's readable text.
+//
+// Only text/plain leaf parts qualify: attachments (PDFs, images, archives) are
+// never requested, text/html is skipped because decoding it would only add
+// markup to the index, and a single-part message that is not text (a bare PDF
+// mail, say) contributes no section at all instead of downloading its payload.
+// Messages without sections are still indexed by subject and sender.
+func textSections(bs imap.BodyStructure) []*imap.FetchItemBodySection {
+	switch root := bs.(type) {
+	case *imap.BodyStructureSinglePart:
+		if root.MediaType() != "text/plain" {
+			return nil
+		}
+		// A non-multipart message has no part numbers: its body is the text.
+		return []*imap.FetchItemBodySection{{Specifier: imap.PartSpecifierText, Peek: true}}
+
+	case *imap.BodyStructureMultiPart:
+		var out []*imap.FetchItemBodySection
+		root.Walk(func(path []int, part imap.BodyStructure) bool {
+			single, ok := part.(*imap.BodyStructureSinglePart)
+			if !ok {
+				return true // multipart node: keep descending
+			}
+			if single.MediaType() != "text/plain" {
+				return true
+			}
+			if disp := single.Disposition(); disp != nil && strings.EqualFold(disp.Value, "attachment") {
+				return true
+			}
+			if len(path) == 0 {
+				return true
+			}
+			out = append(out, &imap.FetchItemBodySection{
+				Part: append([]int(nil), path...),
+				Peek: true,
+			})
+			return true
+		})
+		return out
+
+	default:
+		return nil
+	}
+}
+
+// sectionKey identifies a group of body sections so that every message needing
+// the same parts can share one FETCH command.
+func sectionKey(sections []*imap.FetchItemBodySection) string {
+	var sb strings.Builder
+	for _, s := range sections {
+		sb.WriteString(string(s.Specifier))
+		for _, n := range s.Part {
+			sb.WriteString(strconv.Itoa(n))
+			sb.WriteByte('.')
+		}
+		sb.WriteByte('|')
+	}
+	return sb.String()
 }
 
 // fetchResilient fetches the given UIDs and returns the buffers that could be
@@ -367,6 +451,99 @@ func (c *Client) fetchResilient(folder string, uids []uint32, opts *imap.FetchOp
 	return msgs, bad, rerr
 }
 
+// fetchTextBodies is the second fetch phase: it downloads only the sections
+// chosen by textSections, grouping messages that need the same parts into a
+// single command. A window therefore costs a couple of small fetches instead of
+// one response that drags every attachment along.
+//
+// The returned map holds the decoded body text per UID (empty when the message
+// has nothing readable). UIDs whose text could not be fetched are returned in
+// bad so the caller can fall back to the raw literal.
+func (c *Client) fetchTextBodies(folder string, msgs []*imapclient.FetchMessageBuffer) (map[uint32]string, []uint32, error) {
+	texts := make(map[uint32]string, len(msgs))
+	if len(msgs) == 0 {
+		return texts, nil, nil
+	}
+
+	byUID := make(map[uint32]*imapclient.FetchMessageBuffer, len(msgs))
+	var order []string
+	sections := make(map[string][]*imap.FetchItemBodySection)
+	grouped := make(map[string][]uint32)
+
+	for _, msg := range msgs {
+		uid := uint32(msg.UID)
+		byUID[uid] = msg
+		secs := textSections(msg.BodyStructure)
+		if len(secs) == 0 {
+			// Nothing readable (attachment-only or HTML-only mail): index the
+			// metadata and leave the body empty rather than fetching a payload.
+			texts[uid] = ""
+			continue
+		}
+		k := sectionKey(secs)
+		if _, ok := grouped[k]; !ok {
+			order = append(order, k)
+			sections[k] = secs
+		}
+		grouped[k] = append(grouped[k], uid)
+	}
+
+	var bad []uint32
+	for _, k := range order {
+		uids := grouped[k]
+		got, failed, err := c.fetchResilient(folder, uids, &imap.FetchOptions{
+			UID:         true,
+			BodySection: sections[k],
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+
+		arrived := make(map[uint32]struct{}, len(got))
+		for _, buf := range got {
+			uid := uint32(buf.UID)
+			src := byUID[uid]
+			if src == nil {
+				continue
+			}
+			arrived[uid] = struct{}{}
+			texts[uid] = extractTextFromSections(src.BodyStructure, buf)
+		}
+
+		bad = append(bad, failed...)
+		for _, uid := range uids {
+			if _, ok := arrived[uid]; ok {
+				continue
+			}
+			if slices.Contains(failed, uid) {
+				continue
+			}
+			// The server returned no section for this UID; treat it as failed so
+			// the message is recovered instead of stored without a body.
+			bad = append(bad, uid)
+		}
+	}
+
+	slices.Sort(bad)
+	return texts, slices.Compact(bad), nil
+}
+
+// withoutUIDs returns msgs with the UIDs listed in drop removed.
+func withoutUIDs(msgs []*imapclient.FetchMessageBuffer, drop []uint32) []*imapclient.FetchMessageBuffer {
+	skip := make(map[uint32]struct{}, len(drop))
+	for _, uid := range drop {
+		skip[uid] = struct{}{}
+	}
+	out := make([]*imapclient.FetchMessageBuffer, 0, len(msgs))
+	for _, msg := range msgs {
+		if _, ok := skip[uint32(msg.UID)]; ok {
+			continue
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
 // fetchWindow runs a single FETCH and reports which UIDs actually arrived.
 // A non-nil error means the response stream was not fully usable.
 func (c *Client) fetchWindow(folder string, uids []uint32, opts *imap.FetchOptions) ([]*imapclient.FetchMessageBuffer, map[uint32]struct{}, error) {
@@ -396,13 +573,25 @@ func (c *Client) fetchWindow(folder string, uids []uint32, opts *imap.FetchOptio
 }
 
 // fetchOnce issues one FETCH and collects everything that could be decoded.
+//
+// A response that stops arriving mid-command would otherwise block the whole
+// sync forever: go-imap has no read deadline, so the guard below closes the
+// connection and lets fetchWindow retry (and, if needed, bisect) instead of
+// hanging on one silent server.
 func (c *Client) fetchOnce(uids []uint32, opts *imap.FetchOptions) ([]*imapclient.FetchMessageBuffer, map[uint32]struct{}, error) {
 	var uidSet imap.UIDSet
 	for _, uid := range uids {
 		uidSet.AddNum(imap.UID(uid))
 	}
 
-	fetchCmd := c.client.Fetch(uidSet, opts)
+	client := c.client
+	guard := newStallGuard(fetchStallTimeout, func() {
+		slog.Warn("imap fetch stalled, dropping the connection", "uids", len(uids), "timeout", fetchStallTimeout)
+		client.Close() //nolint:errcheck // the connection is considered lost
+	})
+	defer guard.stop()
+
+	fetchCmd := client.Fetch(uidSet, opts)
 	received := make(map[uint32]struct{}, len(uids))
 	var msgs []*imapclient.FetchMessageBuffer
 
@@ -411,11 +600,13 @@ func (c *Client) fetchOnce(uids []uint32, opts *imap.FetchOptions) ([]*imapclien
 		if msg == nil {
 			break
 		}
+		guard.touch()
 		buf, err := msg.Collect()
 		if err != nil {
 			// The literal could not be read; the stream is most likely gone.
 			break
 		}
+		guard.touch()
 		if !completeFetch(buf, opts) {
 			// A response cut short by a decode error can still deliver a partial
 			// buffer (typically ENVELOPE before a malformed BODYSTRUCTURE).
@@ -429,6 +620,50 @@ func (c *Client) fetchOnce(uids []uint32, opts *imap.FetchOptions) ([]*imapclien
 
 	closeErr := fetchCmd.Close()
 	return msgs, received, closeErr
+}
+
+// stallGuard calls onStall when touch has not been called for d. It is used to
+// bound a FETCH command that the server never finishes.
+type stallGuard struct {
+	mu     sync.Mutex
+	after  time.Duration
+	timer  *time.Timer
+	fired  bool
+	closed bool
+}
+
+func newStallGuard(after time.Duration, onStall func()) *stallGuard {
+	g := &stallGuard{after: after}
+	g.timer = time.AfterFunc(after, func() {
+		g.mu.Lock()
+		if g.closed {
+			g.mu.Unlock()
+			return
+		}
+		g.fired = true
+		g.closed = true
+		g.mu.Unlock()
+		onStall()
+	})
+	return g
+}
+
+// touch restarts the countdown; call it for every sign of progress.
+func (g *stallGuard) touch() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return
+	}
+	g.timer.Reset(g.after)
+}
+
+// stop disarms the guard.
+func (g *stallGuard) stop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.closed = true
+	g.timer.Stop()
 }
 
 // completeFetch reports whether a fetch buffer contains every requested item.
@@ -759,7 +994,7 @@ func checkAndResetUIDValidity(db *sql.DB, logger *slog.Logger, accountID, folder
 // transaction. The checkpoint is advanced by the caller once every UID of the
 // window is resolved, so an interrupted run can never skip a message that was
 // never stored.
-func (c *Client) importMessageBatch(db *sql.DB, logger *slog.Logger, folder string, batch []*imapclient.FetchMessageBuffer, doneBefore, expected int) error {
+func (c *Client) importMessageBatch(db *sql.DB, logger *slog.Logger, folder string, batch []*imapclient.FetchMessageBuffer, texts map[uint32]string, doneBefore, expected int) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("sync: begin transaction: %w", err)
@@ -793,7 +1028,7 @@ func (c *Client) importMessageBatch(db *sql.DB, logger *slog.Logger, folder stri
 
 		// Only index in FTS if the entry was genuinely new (rows affected = 1).
 		if n, _ := res.RowsAffected(); n > 0 {
-			if err := indexNewMessage(tx, stmts, entry, msg, uid); err != nil {
+			if err := indexNewMessage(tx, stmts, entry, msg, texts[uid], uid); err != nil {
 				tx.Rollback()
 				return err
 			}
@@ -901,8 +1136,7 @@ func prepareBatchStmts(tx *sql.Tx) (*batchStmts, error) {
 }
 
 // indexNewMessage inserts FTS, content, and attachment rows for a newly imported message.
-func indexNewMessage(tx *sql.Tx, stmts *batchStmts, entry mailEntry, msg *imapclient.FetchMessageBuffer, uid uint32) error {
-	body := extractBodyText(msg)
+func indexNewMessage(tx *sql.Tx, stmts *batchStmts, entry mailEntry, msg *imapclient.FetchMessageBuffer, body string, uid uint32) error {
 	if _, err := stmts.ftsIns.Exec(entry.ID, entry.Subject, body); err != nil {
 		return fmt.Errorf("sync: fts insert uid=%d: %w", uid, err)
 	}
@@ -1325,76 +1559,53 @@ func extractAttachments(bs imap.BodyStructure) []attachmentInfo {
 	return result
 }
 
-// extractBodyText returns only the text/plain body from a fetch message buffer,
-// skipping base64-encoded attachments and HTML parts.
-// For simple (non-multipart) messages the raw BODY[TEXT] is returned directly.
-// For multipart messages the MIME boundary from BodyStructure is used to split
-// the parts and only text/plain sections are kept.
-func extractBodyText(msg *imapclient.FetchMessageBuffer) string {
-	var raw []byte
+// extractTextFromSections decodes the body sections returned by the text fetch
+// phase and joins them. bs is the message's BODYSTRUCTURE from the metadata
+// phase and supplies the transfer encoding of each part; it may be nil, in
+// which case the bytes are taken as they arrived.
+func extractTextFromSections(bs imap.BodyStructure, msg *imapclient.FetchMessageBuffer) string {
+	if msg == nil {
+		return ""
+	}
+
+	var parts []string
 	for _, section := range msg.BodySection {
-		if section.Section != nil && section.Section.Specifier == imap.PartSpecifierText {
-			raw = section.Bytes
-			break
+		text := strings.TrimSpace(decodeBody(section.Bytes, encodingForSection(bs, section.Section)))
+		if text != "" {
+			parts = append(parts, text)
 		}
 	}
-	if len(raw) == 0 {
+	return strings.Join(parts, "\n")
+}
+
+// encodingForSection finds the Content-Transfer-Encoding of the part a fetched
+// body section belongs to.
+func encodingForSection(bs imap.BodyStructure, section *imap.FetchItemBodySection) string {
+	if bs == nil || section == nil {
+		return ""
+	}
+	if section.Specifier == imap.PartSpecifierText {
+		// BODY[TEXT] of a non-multipart message: the root part's encoding.
+		if sp, ok := bs.(*imap.BodyStructureSinglePart); ok {
+			return sp.Encoding
+		}
+		return ""
+	}
+	if len(section.Part) == 0 {
 		return ""
 	}
 
-	mp, ok := msg.BodyStructure.(*imap.BodyStructureMultiPart)
-	if !ok {
-		return extractSinglePartText(raw, msg.BodyStructure)
-	}
-	return extractMultipartText(raw, mp)
-}
-
-// extractSinglePartText decodes a non-multipart body using its transfer encoding.
-func extractSinglePartText(raw []byte, bs imap.BodyStructure) string {
-	enc := ""
-	if sp, ok := bs.(*imap.BodyStructureSinglePart); ok {
-		enc = sp.Encoding
-	}
-	return strings.TrimSpace(decodeBody(raw, enc))
-}
-
-// extractMultipartText collects text/plain parts from a multipart body using the MIME boundary.
-func extractMultipartText(raw []byte, mp *imap.BodyStructureMultiPart) string {
-	var boundary string
-	if mp.Extended != nil {
-		boundary = mp.Extended.Params["boundary"]
-	}
-	if boundary == "" {
-		return strings.TrimSpace(string(raw))
-	}
-
-	var sb strings.Builder
-	mr := multipart.NewReader(strings.NewReader(string(raw)), boundary)
-	for {
-		part, err := mr.NextPart()
-		if err != nil {
-			break
+	var enc string
+	bs.Walk(func(path []int, part imap.BodyStructure) bool {
+		if !slices.Equal(path, section.Part) {
+			return true
 		}
-		ct := part.Header.Get("Content-Type")
-		mediaType, _, _ := mime.ParseMediaType(ct)
-		// Only collect text/plain parts; skip HTML, images, PDFs, etc.
-		if strings.EqualFold(mediaType, "text/plain") {
-			b, err := io.ReadAll(part)
-			if err == nil && len(b) > 0 {
-				if sb.Len() > 0 {
-					sb.WriteString("\n")
-				}
-				sb.WriteString(decodeBody(b, part.Header.Get("Content-Transfer-Encoding")))
-			}
+		if sp, ok := part.(*imap.BodyStructureSinglePart); ok {
+			enc = sp.Encoding
 		}
-	}
-
-	if sb.Len() == 0 {
-		// No text/plain found (e.g. HTML-only mail) — store nothing rather than
-		// polluting the index with binary/HTML data.
-		return ""
-	}
-	return strings.TrimSpace(sb.String())
+		return false
+	})
+	return enc
 }
 
 // decodeBody decodes a message body from its transfer encoding (quoted-printable or base64).
