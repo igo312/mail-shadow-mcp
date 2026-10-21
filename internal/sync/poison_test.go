@@ -48,6 +48,12 @@ type poisonServer struct {
 	structures map[uint32]string
 	// parts holds the payload returned for a numbered body part ("1", "1.1", …).
 	parts map[uint32]map[string][]byte
+	// flagsEmpty makes the server answer `FLAGS ()` for a UID, which is what a
+	// mailbox full of never-read mail looks like on the wire.
+	flagsEmpty map[uint32]bool
+	// omitMetadata makes the server answer a metadata FETCH without ever sending
+	// a response for these UIDs (a server silently skipping a message).
+	omitMetadata map[uint32]bool
 
 	mu       sync.Mutex
 	conns    int
@@ -63,12 +69,14 @@ func newPoisonServer(t *testing.T, poisonUID uint32, subjects map[uint32]string,
 	}
 
 	s := &poisonServer{
-		ln:         ln,
-		poisonUID:  poisonUID,
-		subjects:   subjects,
-		bodies:     bodies,
-		structures: map[uint32]string{},
-		parts:      map[uint32]map[string][]byte{},
+		ln:           ln,
+		poisonUID:    poisonUID,
+		subjects:     subjects,
+		bodies:       bodies,
+		structures:   map[uint32]string{},
+		parts:        map[uint32]map[string][]byte{},
+		flagsEmpty:   map[uint32]bool{},
+		omitMetadata: map[uint32]bool{},
 	}
 	go s.serve()
 	t.Cleanup(func() { ln.Close() })
@@ -211,6 +219,10 @@ func (s *poisonServer) writeFetch(writer *bufio.Writer, args string) bool {
 		if _, ok := s.subjects[uid]; !ok {
 			continue
 		}
+		if s.omitMetadata[uid] && wantBodyStructure {
+			// The server answers OK but never sends this message's metadata.
+			continue
+		}
 		fmt.Fprintf(writer, "* %d FETCH (UID %d", uidIndex(s.uids(), uid), uid)
 
 		if wantEnvelope {
@@ -218,7 +230,11 @@ func (s *poisonServer) writeFetch(writer *bufio.Writer, args string) bool {
 				imapQuotedDate(), s.subjects[uid])
 		}
 		if wantFlags {
-			fmt.Fprint(writer, ` FLAGS (\Seen)`)
+			if s.flagsEmpty[uid] {
+				fmt.Fprint(writer, ` FLAGS ()`)
+			} else {
+				fmt.Fprint(writer, ` FLAGS (\Seen)`)
+			}
 		}
 		if wantInternalDate {
 			fmt.Fprintf(writer, " INTERNALDATE %q", imapQuotedDate())

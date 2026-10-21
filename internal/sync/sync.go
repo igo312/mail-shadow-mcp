@@ -419,25 +419,29 @@ func (c *Client) fetchResilient(folder string, uids []uint32, opts *imap.FetchOp
 
 	got, received, ferr := c.fetchWindow(folder, uids, opts)
 	msgs = append(msgs, got...)
-	if ferr == nil {
-		return msgs, nil, nil
-	}
 
+	// A UID counts as resolved only if its response actually arrived. A command
+	// that ends without an error but without every response (a server that drops
+	// some UIDs, a response rejected as incomplete) must not be mistaken for
+	// success: the checkpoint advances over this window, so a missing message
+	// would never be fetched again.
 	rest := uidsNotIn(uids, received)
 	if len(rest) == 0 {
-		// Every message arrived even though the command reported an error
-		// (e.g. the server closed the stream right after the last response).
+		// Everything arrived; an error raised after the last response is
+		// harmless because the data is complete.
 		return msgs, nil, nil
 	}
 	if len(rest) == 1 {
 		// The single remaining UID has now failed on its own: it is the message
-		// the server sends malformed data for.
+		// the server does not send in a usable form.
 		return msgs, rest, nil
 	}
 
-	// The stream is dead; a new connection is needed before anything else.
-	if cerr := c.ensureConnected(folder); cerr != nil {
-		return msgs, nil, cerr
+	if ferr != nil {
+		// The stream is dead; a new connection is needed before anything else.
+		if cerr := c.ensureConnected(folder); cerr != nil {
+			return msgs, nil, cerr
+		}
 	}
 
 	mid := len(rest) / 2
@@ -667,14 +671,18 @@ func (g *stallGuard) stop() {
 }
 
 // completeFetch reports whether a fetch buffer contains every requested item.
+//
+// FLAGS is deliberately not checked. go-imap decodes `FLAGS ()` — the normal
+// response for mail that has never been read — to a nil slice, so a message
+// without flags is indistinguishable from one whose FLAGS item never arrived.
+// Treating nil as "missing" silently dropped every unflagged message while the
+// checkpoint still advanced past it, i.e. permanent data loss with no error.
+// is_read then stays NULL and is resolved by backfillFlags.
 func completeFetch(buf *imapclient.FetchMessageBuffer, opts *imap.FetchOptions) bool {
 	if opts.Envelope && buf.Envelope == nil {
 		return false
 	}
 	if opts.BodyStructure != nil && buf.BodyStructure == nil {
-		return false
-	}
-	if opts.Flags && buf.Flags == nil {
 		return false
 	}
 	if len(opts.BodySection) > 0 && len(buf.BodySection) == 0 {
@@ -1452,12 +1460,13 @@ func nullableString(s string) *string {
 	return &s
 }
 
-// flagInts converts an IMAP flags slice into nullable int pointers.
-// Returns non-nil pointers only when the flags slice is non-nil (i.e. was fetched).
+// flagInts converts an IMAP flags slice into int pointers.
+//
+// A nil slice is *not* "unknown": go-imap decodes `FLAGS ()` — a message that
+// has no flags, i.e. any mail that was never read — to nil, and treating that as
+// unknown left every unread message with is_read NULL and sent backfillFlags
+// after it on each run. Nil therefore means "no flags": unread, unanswered.
 func flagInts(flags []imap.Flag) (*int, *int) {
-	if flags == nil {
-		return nil, nil
-	}
 	read, replied := 0, 0
 	for _, f := range flags {
 		switch f {
