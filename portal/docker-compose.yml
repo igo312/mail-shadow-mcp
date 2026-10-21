@@ -1,0 +1,75 @@
+# One public port for the UI, the invite gate and every MCP endpoint.
+#
+#   portal : :8080  ->  Caddy :443  ->  https://$MSM_DOMAIN
+#   instances: internal only, reached by the gateway over msm-net
+#
+# The portal container needs the host Docker socket.  The control database and
+# master key live in the msm-control named volume.
+name: mail-shadow-portal
+
+services:
+  portal:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - msm-control:/srv/msm
+    environment:
+      MSM_DATA_DIR: /srv/msm
+      MSM_PUBLIC_URL: ${MSM_PUBLIC_URL:?set MSM_PUBLIC_URL, e.g. https://mcp.example.com}
+      MSM_DOCKER_NETWORK: msm-net
+      MSM_IMAGE: ${MSM_IMAGE:-ghcr.io/dryas/mail-shadow-mcp:latest}
+      MSM_BACKEND_MODE: network
+      MSM_VERIFY_BACKEND: "1"
+      MSM_SECURE_COOKIES: ${MSM_SECURE_COOKIES:-1}
+      MSM_TRUST_PROXY: "1"
+      MSM_MAX_INSTANCES: ${MSM_MAX_INSTANCES:-25}
+      MSM_CONTAINER_MEMORY: ${MSM_CONTAINER_MEMORY:-512m}
+      MSM_CONTAINER_CPUS: ${MSM_CONTAINER_CPUS:-1.0}
+      MSM_LOG_LEVEL: ${MSM_LOG_LEVEL:-INFO}
+      # Optional first-run invite.  Remove it after creating a real invite with
+      # `docker compose exec portal python cli.py invite create`.
+      MSM_BOOTSTRAP_INVITE: ${MSM_BOOTSTRAP_INVITE:-}
+    networks:
+      - msm-net
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Opt-in TLS terminator.  Enable with:
+  #   docker compose --profile tls up -d --build
+  # Requires MSM_DOMAIN to resolve to this host and ports 80/443 to be open.
+  caddy:
+    image: caddy:2
+    profiles: ["tls"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      MSM_DOMAIN: ${MSM_DOMAIN:-}
+    networks:
+      - msm-net
+    depends_on:
+      - portal
+
+networks:
+  msm-net:
+    name: msm-net
+    driver: bridge
+
+volumes:
+  msm-control:
+  caddy-data:
+  caddy-config:

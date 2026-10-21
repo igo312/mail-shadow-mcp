@@ -1,0 +1,14 @@
+{$MSM_DOMAIN} {
+	encode zstd gzip
+
+	# -1 disables response buffering, which is required for MCP StreamableHTTP
+	# / SSE responses and for the long-lived GET stream.
+	reverse_proxy portal:8080 {
+		flush_interval -1
+	}
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+}

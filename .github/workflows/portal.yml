@@ -1,0 +1,43 @@
+name: Portal
+
+on:
+  push:
+    paths:
+      - 'portal/**'
+      - '.github/workflows/portal.yml'
+  pull_request:
+    paths:
+      - 'portal/**'
+      - '.github/workflows/portal.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test portal
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: portal
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  image:
+    name: Build portal image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t mail-shadow-portal:test portal

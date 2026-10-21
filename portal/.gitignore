@@ -1,0 +1,12 @@
+# Local portal state
+/data/
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
+.idea/
+.vscode/
