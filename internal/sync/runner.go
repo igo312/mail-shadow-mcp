@@ -97,20 +97,30 @@ func RunAll(cfg *config.Config, db *sql.DB) []AccountResult {
 	return results
 }
 
-// syncAccount connects to one IMAP account and syncs all its folders.
+// syncAccount syncs every folder of one account.
+//
+// Every folder gets its own IMAP connection. A message whose response the
+// decoder cannot handle destroys the connection it was fetched on, so a shared
+// connection would take all remaining folders down with it — which is exactly
+// how one malformed message used to fail a whole account.
 func syncAccount(accCfg config.AccountConfig, db *sql.DB) error {
 	logger := slog.With("account", accCfg.ID)
 
-	logger.Info("connecting to IMAP server", "host", accCfg.Host, "port", accCfg.Port)
-	client, err := NewClient(accCfg)
-	if err != nil {
-		return fmt.Errorf("connect: %w", err)
+	// Folder discovery needs a connection, but only when no explicit list is
+	// configured. It is a short-lived connection of its own.
+	var listClient *Client
+	if len(accCfg.Folders) == 0 {
+		c, err := NewClient(accCfg)
+		if err != nil {
+			return fmt.Errorf("connect: %w", err)
+		}
+		listClient = c
 	}
-	defer client.Close()
-	logger.Info("connected")
 
-	// Determine which folders to sync.
-	folders, err := resolveFolders(client, accCfg)
+	folders, err := resolveFolders(listClient, accCfg)
+	if listClient != nil {
+		listClient.Close()
+	}
 	if err != nil {
 		return fmt.Errorf("resolve folders: %w", err)
 	}
@@ -125,7 +135,7 @@ func syncAccount(accCfg config.AccountConfig, db *sql.DB) error {
 			logger.Warn("folder sync already running, skipping", "folder", folder)
 			continue
 		}
-		err := client.SyncFolder(db, folder)
+		err := syncFolderResilient(accCfg, db, folder)
 		fmu.Unlock()
 		if err != nil {
 			logger.Error("folder sync failed", "folder", folder, "err", err)
@@ -137,6 +147,40 @@ func syncAccount(accCfg config.AccountConfig, db *sql.DB) error {
 		return fmt.Errorf("%d folder(s) failed: %w", len(errs), errs[0])
 	}
 	return nil
+}
+
+// folderSyncAttempts is how often a folder sync is retried within a single run.
+// Each attempt resumes from the persisted last_uid, so an interrupted folder
+// costs at most one sync window of re-fetching.
+const (
+	folderSyncAttempts = 3
+	folderRetryBackoff = 5 * time.Second
+)
+
+// syncFolderResilient syncs one folder on a dedicated connection and retries
+// (resuming from the checkpoint) when the connection dies mid-folder.
+func syncFolderResilient(accCfg config.AccountConfig, db *sql.DB, folder string) error {
+	logger := slog.With("account", accCfg.ID, "folder", folder)
+
+	var lastErr error
+	for attempt := 1; attempt <= folderSyncAttempts; attempt++ {
+		client, err := NewClient(accCfg)
+		if err != nil {
+			// Server unreachable — the next scheduled sync will try again.
+			return fmt.Errorf("connect: %w", err)
+		}
+		lastErr = client.SyncFolder(db, folder)
+		client.Close()
+		if lastErr == nil {
+			return nil
+		}
+		if attempt < folderSyncAttempts {
+			logger.Warn("folder sync interrupted, resuming from the last checkpoint",
+				"attempt", attempt, "err", lastErr)
+			time.Sleep(time.Duration(attempt) * folderRetryBackoff)
+		}
+	}
+	return lastErr
 }
 
 // resolveFolders returns the list of folders to sync for an account.
@@ -284,12 +328,7 @@ func syncOneFolder(accCfg config.AccountConfig, folder string, db *sql.DB) error
 	}
 	defer fmu.Unlock()
 
-	client, err := NewClient(accCfg)
-	if err != nil {
-		return fmt.Errorf("connect: %w", err)
-	}
-	defer client.Close()
-	return client.SyncFolder(db, folder)
+	return syncFolderResilient(accCfg, db, folder)
 }
 
 // newIdleClient creates a dedicated IMAP connection with a unilateral data

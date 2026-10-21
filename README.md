@@ -238,6 +238,7 @@ The AI agent has no direct IMAP access. It cannot expunge messages, empty folder
 - **Local shadow database** — emails are synced into a local SQLite database; the AI agent never connects to your IMAP server directly
 - **Read-only sync** — the sync engine only issues read commands (`SELECT`, `UID FETCH`); no `STORE`, `APPEND`, or `EXPUNGE` is ever sent to your mail server
 - **Incremental sync** — only fetches messages newer than the last known UID
+- **Fault-tolerant sync** — a message the server sends in a form the IMAP decoder rejects cannot stall the mailbox; it is isolated, recovered from the raw message, or quarantined
 - **Full-text search** — SQLite FTS5 index for fast body-text queries; queries FTS5 cannot segment (Chinese, Japanese, Korean) automatically fall back to a substring match on subject and body
 - **Multi-account** — sync any number of IMAP accounts simultaneously
 - **IMAP IDLE** — optional real-time push notifications; new mail detected within seconds instead of waiting for the next poll interval
@@ -351,6 +352,51 @@ accounts:
 - Regular polling continues unchanged for all other folders
 - Falls back to polling automatically if the server does not support IDLE
 - Exponential backoff (30 s → 5 min) on persistent connection errors
+
+### Malformed Messages Never Block the Mailbox
+
+Some IMAP servers describe a message in a form the client cannot decode — for
+example a `BODYSTRUCTURE` where a quoted string is missing, which surfaces as:
+
+```
+fetch close error err="in response-data: in body-type-mpart:
+  in body-type-1part: imapwire: expected string, got \"N\""
+```
+
+That error is not "this message failed to parse". The response decoder is a
+single stream: once one response is malformed it stops for good and the socket
+is closed, so **every** later command on that connection fails with
+`use of closed network connection` and the mailbox silently stops syncing at
+that UID. The sync engine therefore isolates messages instead of failing the
+folder:
+
+- **Per-folder connections** — one bad message in `INBOX` can no longer take
+  `Archive` down with it.
+- **Per-window checkpoints** — messages are committed in windows of 100 UIDs and
+  `last_uid` only advances once every UID of a window is resolved, so a restart
+  resumes where it stopped instead of re-fetching the mailbox.
+- **Bisection** — a window whose fetch breaks is retried on a fresh connection
+  and split in half until the offending UID is isolated; the rest of the window
+  is still imported.
+- **Raw-literal fallback** — the isolated message is fetched as `BODY.PEEK[]`
+  and parsed locally with the standard library, bypassing the IMAP structure
+  parser entirely.
+- **Quarantine** — only if that also fails is the UID recorded in the
+  `sync_skipped` table. The sync continues past it, and the message is retried
+  on every run.
+
+To see what is currently quarantined, query the shadow database (it lives in the
+mounted data volume, `data/mail.db` by default):
+
+```sql
+SELECT imap_folder, imap_uid, attempts, reason, first_seen, last_seen
+FROM sync_skipped
+ORDER BY imap_folder, imap_uid;
+```
+
+A row that keeps growing `attempts` is a message the server consistently sends
+in an unusable form; `reason` says which part failed. Nothing is dropped
+silently — the row stays until the message can be parsed.
 
 ### Attachment Download Server
 

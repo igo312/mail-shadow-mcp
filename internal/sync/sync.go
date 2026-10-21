@@ -10,6 +10,23 @@
 // envelope metadata + body text + attachments in batched transactions, and
 // updates the FTS5 index. All IMAP operations are read-only (PEEK fetch,
 // no STORE/APPEND/EXPUNGE).
+//
+// Poison-message handling
+// -----------------------
+// An IMAP response is decoded by a single streaming decoder owned by the
+// client. When one response cannot be decoded — e.g. a server that emits a
+// malformed BODYSTRUCTURE ("imapwire: expected string, got \"N\"") — the
+// decoder stops for good, the connection is torn down, and *every* later
+// command on that client fails with "use of closed network connection".
+// A single bad message therefore takes the whole mailbox (and, before the
+// rework below, every remaining folder of the account) hostage.
+//
+// The only way to make this per-message is to treat a failed stream as a
+// failed *batch*: the batch is retried on a fresh connection and, if it keeps
+// failing, bisected until the unparsable UID is isolated. That UID is then
+// fetched as a raw literal (BODY.PEEK[]) and parsed locally, which bypasses the
+// strict IMAP structure parser entirely. Only if even that fails is the message
+// recorded in sync_skipped and skipped, so that the next messages always sync.
 
 // Package imapsync handles incremental synchronization of IMAP mailboxes
 // into the local SQLite database.
@@ -23,9 +40,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,6 +52,22 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 
 	"github.com/dryas/mail-shadow-mcp/internal/config"
+)
+
+const (
+	// syncWindowSize is the number of UIDs requested per FETCH command.
+	// Small windows bound the work lost when a connection dies mid-stream and
+	// make the bisection that isolates an unparsable message cheap.
+	syncWindowSize = 100
+
+	// fetchAttempts is how often a window is retried on a transient failure
+	// before it is bisected. Decode errors are never retried: they are
+	// deterministic for a given message.
+	fetchAttempts = 2
+
+	// rawMessageLimit caps the size of a message fetched as a single literal in
+	// the fallback path. Bigger messages are quarantined instead of buffered.
+	rawMessageLimit = 32 << 20
 )
 
 // Client wraps an authenticated IMAP connection for a single account.
@@ -44,6 +79,15 @@ type Client struct {
 // NewClient dials the IMAP server and authenticates using PLAIN SASL.
 // The caller is responsible for calling Close() when done.
 func NewClient(cfg config.AccountConfig) (*Client, error) {
+	c, err := dialClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{cfg: cfg, client: c}, nil
+}
+
+// dialClient opens and authenticates a new IMAP connection.
+func dialClient(cfg config.AccountConfig) (*imapclient.Client, error) {
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
 	var tlsCfg *tls.Config
@@ -76,11 +120,14 @@ func NewClient(cfg config.AccountConfig) (*Client, error) {
 		return nil, fmt.Errorf("sync: authenticate %s: %w", cfg.Username, err)
 	}
 
-	return &Client{cfg: cfg, client: c}, nil
+	return c, nil
 }
 
 // Close terminates the IMAP connection.
 func (c *Client) Close() error {
+	if c.client == nil {
+		return nil
+	}
 	return c.client.Close()
 }
 
@@ -88,6 +135,35 @@ func (c *Client) Close() error {
 // direct IMAP access (e.g. on-demand attachment download).
 func (c *Client) RawClient() *imapclient.Client {
 	return c.client
+}
+
+// ensureConnected makes sure c.client is a live, authenticated connection with
+// folder selected. A client whose decoder hit a bad response is dead forever
+// (see the package comment), so it is replaced instead of reused.
+func (c *Client) ensureConnected(folder string) error {
+	if c.client != nil {
+		select {
+		case <-c.client.Closed():
+			c.client.Close() //nolint:errcheck // already dead
+			c.client = nil
+		default:
+			return nil
+		}
+	}
+
+	c.client = nil
+	nc, err := dialClient(c.cfg)
+	if err != nil {
+		return err
+	}
+	if folder != "" {
+		if _, err := nc.Select(folder, nil).Wait(); err != nil {
+			nc.Close()
+			return fmt.Errorf("sync: reselect folder %q: %w", folder, err)
+		}
+	}
+	c.client = nc
+	return nil
 }
 
 // ListFolders returns all available mailbox names on the server.
@@ -107,10 +183,10 @@ func (c *Client) ListFolders() ([]string, error) {
 
 // SyncFolder incrementally syncs one IMAP folder into the database.
 // It fetches only messages with UIDs greater than the stored last_uid,
-// writes them to mail_entries, and updates sync_state on success.
-// Messages are processed in streaming batches of 500 to bound memory usage.
-// IMPORTANT: Only read commands (SELECT, UID FETCH) are issued — never
-// APPEND, STORE, COPY, EXPUNGE or any other write command.
+// writes them to mail_entries, and updates sync_state after every window of
+// syncWindowSize messages so that an interrupted run resumes where it stopped.
+// IMPORTANT: Only read commands (SELECT, UID SEARCH, UID FETCH) are issued —
+// never APPEND, STORE, COPY, EXPUNGE or any other write command.
 func (c *Client) SyncFolder(db *sql.DB, folder string) error {
 	logger := slog.With("account", c.cfg.ID, "folder", folder)
 
@@ -118,7 +194,6 @@ func (c *Client) SyncFolder(db *sql.DB, folder string) error {
 	if err != nil {
 		return fmt.Errorf("sync: get last_uid: %w", err)
 	}
-	logger.Debug("starting sync", "last_uid", lastUID)
 
 	// SELECT the mailbox (read-only via EXAMINE would also work, but SELECT
 	// is required to get the real UID validity value in some libs).
@@ -132,42 +207,23 @@ func (c *Client) SyncFolder(db *sql.DB, folder string) error {
 		return err
 	}
 
-	if selData.NumMessages == 0 {
-		logger.Debug("folder empty, skipping")
-		return nil
+	// Ask the server which UIDs are still missing. UID SEARCH transfers no
+	// message data, so the list is cheap even for large mailboxes and it gives
+	// the bisection below a concrete set of UIDs to work with.
+	pending, err := c.pendingUIDs(lastUID)
+	if err != nil {
+		return fmt.Errorf("sync: list pending uids: %w", err)
 	}
 
-	// Open the IMAP FETCH stream without buffering the whole result set.
-	// We process messages in batches of 500 so that memory usage is bounded
-	// regardless of mailbox size.
-	var uidSet imap.UIDSet
-	uidSet.AddRange(imap.UID(lastUID+1), 0) // 0 means "*" (highest UID)
+	logger.Info("sync start",
+		"pending", len(pending),
+		"mailbox_total", selData.NumMessages,
+		"last_uid", lastUID,
+	)
 
-	fetchOptions := &imap.FetchOptions{
-		UID:           true,
-		Envelope:      true,
-		InternalDate:  true,
-		Flags:         true,
-		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
-		BodySection: []*imap.FetchItemBodySection{
-			{Specifier: imap.PartSpecifierText, Peek: true},
-		},
-	}
-
-	fetchCmd := c.client.Fetch(uidSet, fetchOptions)
-
-	// Peek at the first message to decide if there is anything to do.
-	firstMsg := fetchCmd.Next()
-	if firstMsg == nil {
-		fetchCmd.Close() //nolint:errcheck
+	if len(pending) == 0 {
 		logger.Info("folder up to date, no new messages")
-		if err := c.backfillFlags(db, logger, folder); err != nil {
-			logger.Warn("flag backfill failed", "err", err)
-		}
-		if err := c.backfillEnvelope(db, logger, folder); err != nil {
-			logger.Warn("envelope backfill failed", "err", err)
-		}
-		return nil
+		return c.finishFolder(db, logger, folder)
 	}
 
 	// Disable FTS5 auto-merge during bulk import — dramatically faster for large
@@ -185,87 +241,488 @@ func (c *Client) SyncFolder(db *sql.DB, folder string) error {
 		}()
 	}
 
-	const batchSize = 500
-	expected := int(selData.NumMessages)
-	var totalImported, totalMaxUID uint32
-	var batch []*imapclient.FetchMessageBuffer
-	fetchWindowStart := time.Now()
-
-	// Re-queue the first message we already peeked at.
-	flushBatch := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		batchMax, err := c.importMessageBatch(db, logger, folder, batch, int(totalImported), expected)
-		if err != nil {
-			return err
-		}
-		if batchMax > totalMaxUID {
-			totalMaxUID = batchMax
-		}
-		totalImported += uint32(len(batch))
-		batch = batch[:0]
-		return nil
-	}
-
-	for msg := firstMsg; msg != nil; msg = fetchCmd.Next() {
-		buf, err := msg.Collect()
-		if err != nil {
-			logger.Warn("fetch error, skipping message", "received_so_far", totalImported+uint32(len(batch)), "err", err)
-			continue
-		}
-		batch = append(batch, buf)
-
-		if n := totalImported + uint32(len(batch)); n%50 == 0 {
-			logger.Info("fetching...",
-				"received", n,
-				"mailbox_total", expected,
-				"last_50_ms", time.Since(fetchWindowStart).Milliseconds(),
-			)
-			fetchWindowStart = time.Now()
-		}
-
-		if len(batch) >= batchSize {
-			if err := flushBatch(); err != nil {
-				fetchCmd.Close() //nolint:errcheck
-				return err
-			}
-		}
-	}
-
-	if err := fetchCmd.Close(); err != nil {
-		if !strings.Contains(err.Error(), "NO") && !strings.Contains(err.Error(), "BAD") {
-			logger.Warn("fetch close error", "err", err)
-		}
-	}
-
-	// Flush any remaining messages that didn't fill a full batch.
-	if err := flushBatch(); err != nil {
+	imported, skipped, err := c.importWindows(db, logger, folder, pending)
+	if err != nil {
 		return err
 	}
 
-	if totalImported == 0 {
-		logger.Info("folder up to date, no new messages")
-		if err := c.backfillFlags(db, logger, folder); err != nil {
-			logger.Warn("flag backfill failed", "err", err)
+	logger.Info("sync complete, optimizing FTS index...",
+		"new_messages", imported, "skipped", skipped)
+	persistUIDValidity(db, logger, c.cfg.ID, folder, uint32(selData.UIDValidity))
+	optimizeFTS(db, logger)
+	return c.finishFolder(db, logger, folder)
+}
+
+// importWindows walks the pending UIDs in windows of syncWindowSize and resolves
+// every UID in a window before advancing the checkpoint past it.
+func (c *Client) importWindows(db *sql.DB, logger *slog.Logger, folder string, pending []uint32) (imported, skipped int, err error) {
+	expected := len(pending)
+	done := 0
+
+	for start := 0; start < len(pending); start += syncWindowSize {
+		end := start + syncWindowSize
+		if end > len(pending) {
+			end = len(pending)
 		}
-		if err := c.backfillEnvelope(db, logger, folder); err != nil {
-			logger.Warn("envelope backfill failed", "err", err)
+		window := pending[start:end]
+
+		msgs, bad, ferr := c.fetchResilient(folder, window, structuredFetchOptions())
+		if ferr != nil {
+			return imported, skipped, fmt.Errorf("sync: fetch uid %d..%d: %w", window[0], window[len(window)-1], ferr)
 		}
+
+		if len(msgs) > 0 {
+			if serr := c.importMessageBatch(db, logger, folder, msgs, done, expected); serr != nil {
+				return imported, skipped, serr
+			}
+			imported += len(msgs)
+			done += len(msgs)
+		}
+
+		// The structured fetch could not decode these messages. Try the raw
+		// literal path, which does not depend on the IMAP structure parser.
+		for _, uid := range bad {
+			rerr := c.ingestRaw(db, logger, folder, uid)
+			if rerr == nil {
+				imported++
+				done++
+				continue
+			}
+			logger.Error("message unreadable in every form — quarantining so the rest can sync",
+				"uid", uid, "err", rerr)
+			if qerr := c.quarantine(db, logger, folder, uid, rerr); qerr != nil {
+				return imported, skipped, qerr
+			}
+			skipped++
+		}
+
+		// Every UID in this window has now been stored, recovered or
+		// quarantined, so the checkpoint may move past it.
+		if serr := setLastUID(db, c.cfg.ID, folder, window[len(window)-1]); serr != nil {
+			return imported, skipped, serr
+		}
+	}
+
+	return imported, skipped, nil
+}
+
+// structuredFetchOptions is the regular, compact fetch: metadata plus the
+// text/plain body, without transferring attachment payloads.
+func structuredFetchOptions() *imap.FetchOptions {
+	return &imap.FetchOptions{
+		UID:           true,
+		Envelope:      true,
+		InternalDate:  true,
+		Flags:         true,
+		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierText, Peek: true},
+		},
+	}
+}
+
+// fetchResilient fetches the given UIDs and returns the buffers that could be
+// decoded plus the UIDs that the server sends in an unparsable form.
+//
+// It never gives up on the rest of the batch: when the response stream breaks,
+// the batch is split in half and each half is retried on a fresh connection
+// until the offending UID is isolated. A non-nil error is only returned when the
+// connection cannot be re-established at all.
+func (c *Client) fetchResilient(folder string, uids []uint32, opts *imap.FetchOptions) (msgs []*imapclient.FetchMessageBuffer, bad []uint32, err error) {
+	if len(uids) == 0 {
+		return nil, nil, nil
+	}
+
+	got, received, ferr := c.fetchWindow(folder, uids, opts)
+	msgs = append(msgs, got...)
+	if ferr == nil {
+		return msgs, nil, nil
+	}
+
+	rest := uidsNotIn(uids, received)
+	if len(rest) == 0 {
+		// Every message arrived even though the command reported an error
+		// (e.g. the server closed the stream right after the last response).
+		return msgs, nil, nil
+	}
+	if len(rest) == 1 {
+		// The single remaining UID has now failed on its own: it is the message
+		// the server sends malformed data for.
+		return msgs, rest, nil
+	}
+
+	// The stream is dead; a new connection is needed before anything else.
+	if cerr := c.ensureConnected(folder); cerr != nil {
+		return msgs, nil, cerr
+	}
+
+	mid := len(rest) / 2
+	leftMsgs, leftBad, lerr := c.fetchResilient(folder, rest[:mid], opts)
+	if lerr != nil {
+		return append(msgs, leftMsgs...), leftBad, lerr
+	}
+	rightMsgs, rightBad, rerr := c.fetchResilient(folder, rest[mid:], opts)
+	msgs = append(append(msgs, leftMsgs...), rightMsgs...)
+	bad = append(leftBad, rightBad...)
+	return msgs, bad, rerr
+}
+
+// fetchWindow runs a single FETCH and reports which UIDs actually arrived.
+// A non-nil error means the response stream was not fully usable.
+func (c *Client) fetchWindow(folder string, uids []uint32, opts *imap.FetchOptions) ([]*imapclient.FetchMessageBuffer, map[uint32]struct{}, error) {
+	var (
+		lastMsgs     []*imapclient.FetchMessageBuffer
+		lastReceived map[uint32]struct{}
+		lastErr      error
+	)
+
+	for attempt := 1; attempt <= fetchAttempts; attempt++ {
+		if err := c.ensureConnected(folder); err != nil {
+			return nil, nil, err
+		}
+		msgs, received, err := c.fetchOnce(uids, opts)
+		lastMsgs, lastReceived = msgs, received
+		if err == nil {
+			return msgs, received, nil
+		}
+		lastErr = err
+		if isDecodeError(err) {
+			// Deterministic for this data — retrying the same request would
+			// write an identical malformed response.
+			break
+		}
+	}
+	return lastMsgs, lastReceived, lastErr
+}
+
+// fetchOnce issues one FETCH and collects everything that could be decoded.
+func (c *Client) fetchOnce(uids []uint32, opts *imap.FetchOptions) ([]*imapclient.FetchMessageBuffer, map[uint32]struct{}, error) {
+	var uidSet imap.UIDSet
+	for _, uid := range uids {
+		uidSet.AddNum(imap.UID(uid))
+	}
+
+	fetchCmd := c.client.Fetch(uidSet, opts)
+	received := make(map[uint32]struct{}, len(uids))
+	var msgs []*imapclient.FetchMessageBuffer
+
+	for {
+		msg := fetchCmd.Next()
+		if msg == nil {
+			break
+		}
+		buf, err := msg.Collect()
+		if err != nil {
+			// The literal could not be read; the stream is most likely gone.
+			break
+		}
+		if !completeFetch(buf, opts) {
+			// A response cut short by a decode error can still deliver a partial
+			// buffer (typically ENVELOPE before a malformed BODYSTRUCTURE).
+			// Storing it would silently lose the body text, so leave the UID
+			// unresolved: the caller recovers it from the raw message instead.
+			continue
+		}
+		received[uint32(buf.UID)] = struct{}{}
+		msgs = append(msgs, buf)
+	}
+
+	closeErr := fetchCmd.Close()
+	return msgs, received, closeErr
+}
+
+// completeFetch reports whether a fetch buffer contains every requested item.
+func completeFetch(buf *imapclient.FetchMessageBuffer, opts *imap.FetchOptions) bool {
+	if opts.Envelope && buf.Envelope == nil {
+		return false
+	}
+	if opts.BodyStructure != nil && buf.BodyStructure == nil {
+		return false
+	}
+	if opts.Flags && buf.Flags == nil {
+		return false
+	}
+	if len(opts.BodySection) > 0 && len(buf.BodySection) == 0 {
+		return false
+	}
+	return true
+}
+
+// isDecodeError reports whether the error comes from the IMAP response decoder
+// rather than from the network. Such errors repeat identically for the same
+// message, so retrying is pointless.
+func isDecodeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, marker := range []string{
+		"imapwire",
+		"in response",
+		"in body-type",
+		"in body-structure",
+		"in envelope",
+		"in fetch",
+		"in address",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// pendingUIDs returns every UID in the selected mailbox greater than after,
+// in ascending order.
+func (c *Client) pendingUIDs(after uint32) ([]uint32, error) {
+	if after == math.MaxUint32 {
+		return nil, nil
+	}
+
+	var set imap.UIDSet
+	set.AddRange(imap.UID(after+1), 0) // 0 means "*" (highest UID)
+
+	data, err := c.client.UIDSearch(&imap.SearchCriteria{UID: []imap.UIDSet{set}}, nil).Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	uids := expandUIDSet(data.All)
+	// RFC 3501: a range of "x:*" always matches the last message, even when x is
+	// higher than every assigned UID. Drop whatever the checkpoint already covers.
+	out := make([]uint32, 0, len(uids))
+	for _, uid := range uids {
+		if uid > after {
+			out = append(out, uid)
+		}
+	}
+	return out, nil
+}
+
+// expandUIDSet flattens a UID set response into a sorted, duplicate-free slice.
+func expandUIDSet(set imap.NumSet) []uint32 {
+	uidSet, ok := set.(imap.UIDSet)
+	if !ok {
 		return nil
 	}
 
-	logger.Info("sync complete, optimizing FTS index...", "new_messages", totalImported, "max_uid", totalMaxUID)
-	persistUIDValidity(db, logger, c.cfg.ID, folder, uint32(selData.UIDValidity))
-	optimizeFTS(db, logger)
+	var out []uint32
+	for _, r := range uidSet {
+		start, stop := uint32(r.Start), uint32(r.Stop)
+		if stop == 0 || stop < start {
+			// A wildcard never appears in a server response; ignore it rather
+			// than expanding it to four billion UIDs.
+			continue
+		}
+		for u := start; ; u++ {
+			out = append(out, u)
+			if u == stop || u == math.MaxUint32 {
+				break
+			}
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// uidsNotIn returns the entries of uids that are not present in received,
+// preserving order.
+func uidsNotIn(uids []uint32, received map[uint32]struct{}) []uint32 {
+	if len(received) == 0 {
+		return uids
+	}
+	out := make([]uint32, 0, len(uids))
+	for _, uid := range uids {
+		if _, ok := received[uid]; !ok {
+			out = append(out, uid)
+		}
+	}
+	return out
+}
+
+// finishFolder runs the resumable post-processing steps. None of them may fail
+// the folder sync: they are best effort and retried on the next run.
+func (c *Client) finishFolder(db *sql.DB, logger *slog.Logger, folder string) error {
+	if err := c.retrySkipped(db, logger, folder); err != nil {
+		logger.Warn("skipped-message retry failed", "err", err)
+	}
 	if err := c.backfillFlags(db, logger, folder); err != nil {
 		logger.Warn("flag backfill failed", "err", err)
 	}
 	if err := c.backfillEnvelope(db, logger, folder); err != nil {
 		logger.Warn("envelope backfill failed", "err", err)
 	}
-	logger.Info("sync complete", "new_messages", totalImported, "max_uid", totalMaxUID)
 	return nil
+}
+
+// quarantine records a message that cannot be fetched in any form. The UID is
+// remembered so it is retried later instead of silently disappearing, and it is
+// never retried in the main sync path — that is what would stall the mailbox.
+func (c *Client) quarantine(db *sql.DB, logger *slog.Logger, folder string, uid uint32, cause error) error {
+	reason := ""
+	if cause != nil {
+		reason = cause.Error()
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	if _, err := db.Exec(`
+		INSERT INTO sync_skipped (account_id, imap_folder, imap_uid, reason, attempts, first_seen, last_seen)
+		VALUES (?, ?, ?, ?, 1, ?, ?)
+		ON CONFLICT(account_id, imap_folder, imap_uid) DO UPDATE SET
+			reason    = excluded.reason,
+			attempts  = sync_skipped.attempts + 1,
+			last_seen = excluded.last_seen`,
+		c.cfg.ID, folder, uid, reason, now, now,
+	); err != nil {
+		return fmt.Errorf("sync: quarantine uid=%d: %w", uid, err)
+	}
+
+	logger.Error("message quarantined — the server response for this UID cannot be parsed",
+		"uid", uid, "reason", reason,
+		"hint", "listed in table sync_skipped; retried on every sync via the raw-literal fallback")
+	return nil
+}
+
+// retrySkipped re-attempts every quarantined message through the raw-literal
+// path. Messages that succeed are removed from sync_skipped.
+func (c *Client) retrySkipped(db *sql.DB, logger *slog.Logger, folder string) error {
+	rows, err := db.Query(
+		`SELECT imap_uid FROM sync_skipped WHERE account_id = ? AND imap_folder = ? ORDER BY imap_uid`,
+		c.cfg.ID, folder,
+	)
+	if err != nil {
+		return fmt.Errorf("retrySkipped: query: %w", err)
+	}
+	var uids []uint32
+	for rows.Next() {
+		var uid uint32
+		if err := rows.Scan(&uid); err == nil {
+			uids = append(uids, uid)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("retrySkipped: iterate: %w", err)
+	}
+	rows.Close()
+
+	if len(uids) == 0 {
+		return nil
+	}
+
+	logger.Info("retrying quarantined messages", "count", len(uids))
+	for _, uid := range uids {
+		if err := c.ingestRaw(db, logger, folder, uid); err != nil {
+			_, _ = db.Exec(
+				`UPDATE sync_skipped SET attempts = attempts + 1, reason = ?, last_seen = ?
+				 WHERE account_id = ? AND imap_folder = ? AND imap_uid = ?`,
+				err.Error(), time.Now().UTC().Format(time.RFC3339), c.cfg.ID, folder, uid,
+			)
+			continue
+		}
+		if _, err := db.Exec(
+			`DELETE FROM sync_skipped WHERE account_id = ? AND imap_folder = ? AND imap_uid = ?`,
+			c.cfg.ID, folder, uid,
+		); err != nil {
+			logger.Warn("could not clear quarantined message", "uid", uid, "err", err)
+		}
+	}
+	return nil
+}
+
+// ingestRaw fetches one message as a single raw literal and parses it locally.
+// This is the fallback for messages whose BODYSTRUCTURE or ENVELOPE the server
+// sends in a form the IMAP decoder rejects: a literal is length-prefixed, so no
+// structure parsing is involved at all.
+func (c *Client) ingestRaw(db *sql.DB, logger *slog.Logger, folder string, uid uint32) error {
+	if err := c.ensureConnected(folder); err != nil {
+		return err
+	}
+
+	var uidSet imap.UIDSet
+	uidSet.AddNum(imap.UID(uid))
+
+	fetchCmd := c.client.Fetch(uidSet, &imap.FetchOptions{
+		UID:          true,
+		Flags:        true,
+		InternalDate: true,
+		RFC822Size:   true,
+		BodySection:  []*imap.FetchItemBodySection{{Peek: true}}, // BODY.PEEK[]
+	})
+
+	var buf *imapclient.FetchMessageBuffer
+	for {
+		msg := fetchCmd.Next()
+		if msg == nil {
+			break
+		}
+		b, err := msg.Collect()
+		if err != nil {
+			break
+		}
+		buf = b
+	}
+	if err := fetchCmd.Close(); err != nil {
+		return fmt.Errorf("raw fetch uid=%d: %w", uid, err)
+	}
+	if buf == nil {
+		return fmt.Errorf("raw fetch uid=%d: no message returned", uid)
+	}
+	if buf.RFC822Size > rawMessageLimit {
+		return fmt.Errorf("raw fetch uid=%d: message exceeds the %d byte raw limit", uid, rawMessageLimit)
+	}
+
+	var raw []byte
+	for _, section := range buf.BodySection {
+		raw = section.Bytes
+		break
+	}
+	if len(raw) == 0 {
+		return fmt.Errorf("raw fetch uid=%d: empty body", uid)
+	}
+
+	parsed, err := parseRawMessage(raw)
+	if err != nil {
+		return fmt.Errorf("raw parse uid=%d: %w", uid, err)
+	}
+
+	entry := rawEntry(c.cfg.ID, folder, uid, buf, parsed)
+	if err := c.storeEntry(db, entry, parsed.Text, parsed.Attachments); err != nil {
+		return err
+	}
+
+	logger.Info("message recovered via raw literal fetch",
+		"uid", uid, "subject", entry.Subject, "attachments", len(parsed.Attachments))
+	return nil
+}
+
+// rawEntry builds the DB row for a message that was parsed locally.
+func rawEntry(accountID, folder string, uid uint32, buf *imapclient.FetchMessageBuffer, p rawMessage) mailEntry {
+	var dateUTC any
+	switch {
+	case !p.Date.IsZero():
+		dateUTC = p.Date.UTC().Format(time.RFC3339)
+	case !buf.InternalDate.IsZero():
+		dateUTC = buf.InternalDate.UTC().Format(time.RFC3339)
+	}
+
+	isRead, isReplied := flagInts(buf.Flags)
+
+	return mailEntry{
+		ID:           fmt.Sprintf("%s:%s:%d", accountID, folder, uid),
+		AccountID:    accountID,
+		IMAPUID:      uid,
+		IMAPFolder:   folder,
+		Subject:      p.Subject,
+		Sender:       p.From,
+		RecipientsTo: p.To,
+		RecipientsCC: p.Cc,
+		DateUTC:      dateUTC,
+		IsRead:       isRead,
+		IsReplied:    isReplied,
+		MessageID:    nullableString(p.MessageID),
+		InReplyTo:    nullableString(p.InReplyTo),
+	}
 }
 
 // checkAndResetUIDValidity compares the server UIDValidity against the stored value.
@@ -298,21 +755,23 @@ func checkAndResetUIDValidity(db *sql.DB, logger *slog.Logger, accountID, folder
 	return 0, nil
 }
 
-// importMessageBatch writes one slice of fetched messages into a single DB transaction.
-func (c *Client) importMessageBatch(db *sql.DB, logger *slog.Logger, folder string, batch []*imapclient.FetchMessageBuffer, batchStart, total int) (uint32, error) {
+// importMessageBatch writes one slice of fetched messages into a single DB
+// transaction. The checkpoint is advanced by the caller once every UID of the
+// window is resolved, so an interrupted run can never skip a message that was
+// never stored.
+func (c *Client) importMessageBatch(db *sql.DB, logger *slog.Logger, folder string, batch []*imapclient.FetchMessageBuffer, doneBefore, expected int) error {
 	tx, err := db.Begin()
 	if err != nil {
-		return 0, fmt.Errorf("sync: begin transaction: %w", err)
+		return fmt.Errorf("sync: begin transaction: %w", err)
 	}
 
 	stmts, err := prepareBatchStmts(tx)
 	if err != nil {
 		tx.Rollback()
-		return 0, err
+		return err
 	}
 
 	const progressInterval = 50
-	var batchMaxUID uint32
 	dbWindowStart := time.Now()
 	for j, msg := range batch {
 		if msg.Envelope == nil {
@@ -329,41 +788,82 @@ func (c *Client) importMessageBatch(db *sql.DB, logger *slog.Logger, folder stri
 		)
 		if err != nil {
 			tx.Rollback()
-			return 0, fmt.Errorf("sync: insert entry uid=%d: %w", uid, err)
+			return fmt.Errorf("sync: insert entry uid=%d: %w", uid, err)
 		}
 
 		// Only index in FTS if the entry was genuinely new (rows affected = 1).
 		if n, _ := res.RowsAffected(); n > 0 {
 			if err := indexNewMessage(tx, stmts, entry, msg, uid); err != nil {
 				tx.Rollback()
-				return 0, err
+				return err
 			}
 		}
 
-		if uid > batchMaxUID {
-			batchMaxUID = uid
-		}
-		done := batchStart + j + 1
-		if done%progressInterval == 0 || done == total {
+		done := doneBefore + j + 1
+		if done%progressInterval == 0 || (expected > 0 && done == expected) {
+			percent := 0
+			if expected > 0 {
+				percent = done * 100 / expected
+			}
 			logger.Info("import progress",
-				"processed", done, "total", total,
-				"percent", done*100/total,
+				"processed", done, "total", expected,
+				"percent", percent,
 				"last_50_db_ms", time.Since(dbWindowStart).Milliseconds(),
 			)
 			dbWindowStart = time.Now()
 		}
 	}
 
-	if batchMaxUID > 0 {
-		if err := updateLastUID(tx, c.cfg.ID, folder, batchMaxUID); err != nil {
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sync: commit batch: %w", err)
+	}
+	return nil
+}
+
+// storeEntry writes one locally parsed message (raw-literal fallback path).
+func (c *Client) storeEntry(db *sql.DB, entry mailEntry, body string, attachments []attachmentInfo) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("sync: begin transaction: %w", err)
+	}
+	stmts, err := prepareBatchStmts(tx)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	res, err := stmts.entry.Exec(
+		entry.ID, entry.AccountID, entry.IMAPUID, entry.IMAPFolder,
+		entry.Subject, entry.Sender, entry.RecipientsTo, entry.RecipientsCC,
+		entry.DateUTC, entry.IsRead, entry.IsReplied,
+		entry.MessageID, entry.InReplyTo,
+	)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("sync: insert raw entry uid=%d: %w", entry.IMAPUID, err)
+	}
+
+	if n, _ := res.RowsAffected(); n > 0 {
+		if _, err := stmts.ftsIns.Exec(entry.ID, entry.Subject, body); err != nil {
 			tx.Rollback()
-			return 0, fmt.Errorf("sync: update last_uid: %w", err)
+			return fmt.Errorf("sync: fts insert uid=%d: %w", entry.IMAPUID, err)
+		}
+		if _, err := stmts.contentIns.Exec(entry.ID, body); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("sync: content insert uid=%d: %w", entry.IMAPUID, err)
+		}
+		for _, att := range attachments {
+			if _, err := stmts.att.Exec(entry.ID, att.Filename, att.ContentType, att.SizeBytes); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("sync: insert attachment uid=%d: %w", entry.IMAPUID, err)
+			}
 		}
 	}
+
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("sync: commit batch: %w", err)
+		return fmt.Errorf("sync: commit raw entry uid=%d: %w", entry.IMAPUID, err)
 	}
-	return batchMaxUID, nil
+	return nil
 }
 
 // batchStmts holds pre-compiled statements for a single import transaction.
@@ -514,7 +1014,13 @@ func (c *Client) backfillFlags(db *sql.DB, logger *slog.Logger, folder string) e
 			results = append(results, flagResult{uint32(buf.UID), isRead, isReplied})
 		}
 		if err := fetchCmd.Close(); err != nil {
-			logger.Warn("backfillFlags: fetch close error", "err", err)
+			// Leave the rows NULL instead of writing guessed flags: the batch is
+			// retried on the next sync, and the next folder still gets its turn.
+			logger.Warn("backfillFlags: fetch failed, leaving batch untouched", "err", err)
+			if cerr := c.ensureConnected(folder); cerr != nil {
+				return fmt.Errorf("backfillFlags: reconnect: %w", cerr)
+			}
+			continue
 		}
 
 		// Write results in a single transaction per batch.
@@ -583,12 +1089,17 @@ func (c *Client) backfillEnvelope(db *sql.DB, logger *slog.Logger, folder string
 		}
 		batch := uids[start:end]
 
-		var uidSet imap.UIDSet
-		for _, uid := range batch {
-			uidSet.AddNum(imap.UID(uid))
+		// A malformed ENVELOPE kills the connection just like a malformed
+		// BODYSTRUCTURE, so the batch is bisected on failure and the offending
+		// UIDs are written as "processed but empty" by the pre-population below.
+		msgs, bad, err := c.fetchResilient(folder, batch, &imap.FetchOptions{UID: true, Envelope: true})
+		if err != nil {
+			return fmt.Errorf("backfillEnvelope: fetch: %w", err)
+		}
+		for _, uid := range bad {
+			logger.Warn("backfillEnvelope: unparsable envelope, leaving message-id empty", "uid", uid)
 		}
 
-		fetchCmd := c.client.Fetch(uidSet, &imap.FetchOptions{UID: true, Envelope: true})
 		// Use string (not *string) so that empty values write "" instead of NULL.
 		// The backfill query selects WHERE message_id IS NULL; writing "" marks a row
 		// as "processed" even when the mail has no Message-ID header, preventing the
@@ -607,16 +1118,7 @@ func (c *Client) backfillEnvelope(db *sql.DB, logger *slog.Logger, folder string
 			results[i] = envResult{uid: uid}
 			uidToIdx[uid] = i
 		}
-		for {
-			msg := fetchCmd.Next()
-			if msg == nil {
-				break
-			}
-			buf, err := msg.Collect()
-			if err != nil {
-				logger.Warn("backfillEnvelope: collect error", "err", err)
-				continue
-			}
+		for _, buf := range msgs {
 			if buf.Envelope == nil {
 				continue
 			}
@@ -624,9 +1126,6 @@ func (c *Client) backfillEnvelope(db *sql.DB, logger *slog.Logger, folder string
 				results[idx].msgID = strings.TrimSpace(buf.Envelope.MessageID)
 				results[idx].inReplyTo = strings.TrimSpace(strings.Join(buf.Envelope.InReplyTo, " "))
 			}
-		}
-		if err := fetchCmd.Close(); err != nil {
-			logger.Warn("backfillEnvelope: fetch close error", "err", err)
 		}
 
 		tx, err := db.Begin()
@@ -749,13 +1248,19 @@ func getLastUID(db *sql.DB, accountID, folder string) (uint32, error) {
 	return lastUID, err
 }
 
-func updateLastUID(tx *sql.Tx, accountID, folder string, uid uint32) error {
-	_, err := tx.Exec(`
+// setLastUID advances the checkpoint for a folder without moving it backwards.
+// It is the only place the checkpoint is written, so a window is only ever
+// marked as done after every UID in it has been stored, recovered or
+// quarantined.
+func setLastUID(db *sql.DB, accountID, folder string, uid uint32) error {
+	if _, err := db.Exec(`
 		INSERT INTO sync_state (account_id, imap_folder, last_uid) VALUES (?, ?, ?)
-		ON CONFLICT(account_id, imap_folder) DO UPDATE SET last_uid = excluded.last_uid`,
+		ON CONFLICT(account_id, imap_folder) DO UPDATE SET last_uid = MAX(sync_state.last_uid, excluded.last_uid)`,
 		accountID, folder, uid,
-	)
-	return err
+	); err != nil {
+		return fmt.Errorf("sync: advance last_uid to %d: %w", uid, err)
+	}
+	return nil
 }
 
 func getStoredUIDValidity(db *sql.DB, accountID, folder string) (uint32, error) {

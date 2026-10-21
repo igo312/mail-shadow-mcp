@@ -6,13 +6,14 @@
 //
 // db.go:
 // Opens and configures the SQLite shadow database and runs idempotent schema
-// migrations. The schema consists of five tables:
+// migrations. The schema consists of six tables:
 //
 //	mail_entries      — envelope metadata (subject, sender, date, …)
 //	mail_attachments  — attachment metadata, 1:n to mail_entries
 //	mail_content      — plain-text body, 1:1 to mail_entries, fast PK lookup
 //	mail_content_fts  — FTS5 virtual table for full-text search
 //	sync_state        — highest UID synced per account+folder
+//	sync_skipped      — messages whose IMAP data cannot be decoded (quarantine)
 package db
 
 import (
@@ -99,6 +100,20 @@ func Migrate(db *sql.DB) error {
 			imap_folder TEXT NOT NULL,
 			last_uid    INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (account_id, imap_folder)
+		)`,
+
+		// Quarantine for messages the IMAP decoder cannot handle. The sync
+		// advances past them so one broken message cannot stall the mailbox,
+		// and retries them on every run through the raw-literal fallback.
+		`CREATE TABLE IF NOT EXISTS sync_skipped (
+			account_id  TEXT    NOT NULL,
+			imap_folder TEXT    NOT NULL,
+			imap_uid    INTEGER NOT NULL,
+			reason      TEXT    NOT NULL DEFAULT '',
+			attempts    INTEGER NOT NULL DEFAULT 1,
+			first_seen  TIMESTAMP,
+			last_seen   TIMESTAMP,
+			PRIMARY KEY (account_id, imap_folder, imap_uid)
 		)`,
 
 		// FTS5 virtual table for full-text search over subject + body

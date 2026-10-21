@@ -43,19 +43,11 @@ func TestGetLastUID_NoEntry(t *testing.T) {
 	}
 }
 
-func TestUpdateAndGetLastUID(t *testing.T) {
+func TestSetAndGetLastUID(t *testing.T) {
 	database := openTestDB(t)
 
-	tx, err := database.Begin()
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
-	}
-
-	if err := updateLastUID(tx, "test@example.com", "INBOX", 42); err != nil {
-		t.Fatalf("updateLastUID: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("Commit: %v", err)
+	if err := setLastUID(database, "test@example.com", "INBOX", 42); err != nil {
+		t.Fatalf("setLastUID: %v", err)
 	}
 
 	uid, err := getLastUID(database, "test@example.com", "INBOX")
@@ -67,19 +59,12 @@ func TestUpdateAndGetLastUID(t *testing.T) {
 	}
 }
 
-func TestUpdateLastUID_Idempotent(t *testing.T) {
+func TestSetLastUID_Idempotent(t *testing.T) {
 	database := openTestDB(t)
 
 	for _, value := range []uint32{10, 20, 30} {
-		tx, err := database.Begin()
-		if err != nil {
-			t.Fatalf("Begin: %v", err)
-		}
-		if err := updateLastUID(tx, "test@example.com", "INBOX", value); err != nil {
-			t.Fatalf("updateLastUID(%d): %v", value, err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatalf("Commit: %v", err)
+		if err := setLastUID(database, "test@example.com", "INBOX", value); err != nil {
+			t.Fatalf("setLastUID(%d): %v", value, err)
 		}
 	}
 
