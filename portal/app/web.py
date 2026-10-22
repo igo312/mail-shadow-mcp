@@ -387,6 +387,12 @@ class WebApp:
         if not instance:
             self._error(handler, 404, "实例不存在", "链接可能已经失效。")
             return
+        owner = str(instance.get("owner_invite") or "")
+        if owner and owner != session["invite"]:
+            # Do not reveal another invite's mailbox details.  Instance IDs are
+            # random, but a leaked link must not become a cross-tenant read.
+            self._error(handler, 404, "实例不存在", "链接可能已经失效。")
+            return
 
         flash_cookie = _cookies(handler).get(FLASH_COOKIE, "")
         if flash_cookie:

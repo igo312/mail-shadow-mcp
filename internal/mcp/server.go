@@ -23,6 +23,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -39,6 +40,53 @@ import (
 	"github.com/dryas/mail-shadow-mcp/internal/fileserver"
 	imapsync "github.com/dryas/mail-shadow-mcp/internal/sync"
 )
+
+const (
+	// maxEmailBodyRunes bounds get_email_content responses.  The SQL query
+	// fetches at most one rune more than the limit, so a huge body never has to
+	// be materialised in memory just to be truncated in Go.
+	maxEmailBodyRunes = 20_000
+
+	// maxSearchBodyRunes bounds include_body results.  Without this a single
+	// search over 100 HTML/newsletter bodies could return hundreds of
+	// megabytes, which makes MCP clients appear to hang.
+	maxSearchBodyRunes = 4_000
+
+	// maxThreadMessages bounds get_thread; a pathological thread can otherwise
+	// return an unbounded number of messages.
+	maxThreadMessages = 500
+
+	// dbQueryTimeout bounds read-only tool queries.  A CJK substring fallback or
+	// an unindexed filter on a multi-million-row mailbox can otherwise keep the
+	// single SQLite connection busy long enough for the agent to time out.  A
+	// clear error is better than a silent hang; the caller can narrow filters.
+	dbQueryTimeout = 20 * time.Second
+)
+
+// substringScanLimit bounds how many of the most recent messages the CJK
+// substring fallback examines.  A LIKE '%term%' over every body in a large
+// mailbox is a full table scan and was the main reason a Chinese search could
+// appear to hang.  The default keeps the scan in the low tens of thousands of
+// rows; callers see scan_limited=true when this path was used.
+var substringScanLimit = 20_000
+
+// queryCtx adds the read-query budget unless the caller already supplied an
+// earlier deadline.
+func queryCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, dbQueryTimeout)
+}
+
+// truncateRunes shortens s to at most limit runes and reports whether it did.
+func truncateRunes(s string, limit int) (string, bool) {
+	if limit <= 0 {
+		return s, false
+	}
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s, false
+	}
+	return string(runes[:limit]) + "\n[... truncated]", true
+}
 
 // New creates and returns a configured MCP server with all tools registered.
 // db is the open SQLite connection; cfg is the loaded configuration.
@@ -109,9 +157,12 @@ func validateIsRead(value string) string {
 
 // fmtDBError formats a database error, providing extra guidance for FTS5 syntax errors.
 func fmtDBError(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Sprintf("query timed out after %s; narrow the filters (account, folder, date range) and retry", dbQueryTimeout)
+	}
 	s := err.Error()
 	if strings.Contains(s, "fts5") || strings.Contains(s, "syntax error") {
-		return fmt.Sprintf("invalid search query syntax (%v). Use simple keywords or quoted phrases (e.g. \"invoice april\"). Avoid special characters like +, -, *, ( ) unless you know FTS5 syntax.", err)
+		return fmt.Sprintf("invalid search query syntax (%v). Use simple space-separated keywords (e.g. invoice april).", err)
 	}
 	return fmt.Sprintf("db error: %v", err)
 }
@@ -185,6 +236,8 @@ type accountInfo struct {
 
 func handleListAccountsAndFolders(db *sql.DB, cfg *config.Config) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ctx, cancel := queryCtx(ctx)
+		defer cancel()
 		slog.Info("tool called", "tool", "list_accounts_and_folders")
 		rows, err := db.QueryContext(ctx,
 			`SELECT account_id, imap_folder, last_uid FROM sync_state ORDER BY account_id, imap_folder`)
@@ -228,10 +281,12 @@ func handleListAccountsAndFolders(db *sql.DB, cfg *config.Config) server.ToolHan
 
 // pagedResult wraps a paginated tool response with total_count metadata.
 type pagedResult[T any] struct {
-	TotalCount int `json:"total_count"`
-	Offset     int `json:"offset"`
-	Limit      int `json:"limit"`
-	Results    []T `json:"results"`
+	TotalCount  int  `json:"total_count"`
+	Offset      int  `json:"offset"`
+	Limit       int  `json:"limit"`
+	ScanLimited bool `json:"scan_limited,omitempty"`
+	ScanLimit   int  `json:"scan_limit,omitempty"`
+	Results     []T  `json:"results"`
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +346,8 @@ const fetchAttachmentsSubquery = `COALESCE((SELECT json_group_array(json_object(
 
 func handleGetRecentActivity(db *sql.DB, cfg *config.Config) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ctx, cancel := queryCtx(ctx)
+		defer cancel()
 		account := req.GetString("account", "")
 		folder := req.GetString("folder", "")
 		limit := int(req.GetFloat("limit", 10))
@@ -331,7 +388,7 @@ func handleGetRecentActivity(db *sql.DB, cfg *config.Config) server.ToolHandlerF
 		} else if isRead == "false" {
 			qb.and("e.is_read = 0")
 		}
-		applyTrashExclusions(qb, cfg)
+		applyTrashExclusions(qb, cfg, "e")
 		qb.write(` ORDER BY e.date_utc DESC NULLS LAST LIMIT ? OFFSET ?`)
 		qb.args = append(qb.args, limit, offset)
 
@@ -422,6 +479,8 @@ type mailDetail struct {
 
 func handleGetEmailContent(db *sql.DB) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ctx, cancel := queryCtx(ctx)
+		defer cancel()
 		entryID, err := req.RequireString("entry_id")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -434,9 +493,9 @@ func handleGetEmailContent(db *sql.DB) server.ToolHandlerFunc {
 		err = db.QueryRowContext(ctx, `
 			SELECT e.id, e.account_id, e.imap_folder, e.subject, e.sender,
 			       e.recipients_to, e.recipients_cc, e.date_utc, e.is_read, e.is_replied,
-			       COALESCE((SELECT body_text FROM mail_content WHERE entry_id = e.id), '')
+			       COALESCE((SELECT substr(body_text, 1, ?) FROM mail_content WHERE entry_id = e.id), '')
 			FROM mail_entries e
-			WHERE e.id = ?`, entryID,
+			WHERE e.id = ?`, maxEmailBodyRunes+1, entryID,
 		).Scan(
 			&m.ID, &m.AccountID, &m.Folder, &m.Subject, &m.Sender,
 			&m.RecipientsTo, &m.RecipientsCC, &rawDateStr, &rawIsRead, &rawIsReplied,
@@ -460,11 +519,10 @@ func handleGetEmailContent(db *sql.DB) server.ToolHandlerFunc {
 			m.IsReplied = &v
 		}
 
-		// Truncate very large bodies to avoid flooding the agent context window.
-		const maxBodyRunes = 20_000
-		if runes := []rune(m.BodyText); len(runes) > maxBodyRunes {
-			m.BodyText = string(runes[:maxBodyRunes]) + "\n[... truncated]"
-		}
+		// Truncate to avoid flooding the agent context window.  The SQL above
+		// already fetched only limit+1 runes, so this does not hold the whole
+		// body in memory first.
+		m.BodyText, _ = truncateRunes(m.BodyText, maxEmailBodyRunes)
 
 		attRows, err := db.QueryContext(ctx,
 			`SELECT COALESCE(filename,''), COALESCE(content_type,''), COALESCE(size_bytes,0) FROM mail_attachments WHERE entry_id = ?`, entryID)
@@ -496,14 +554,14 @@ func handleGetEmailContent(db *sql.DB) server.ToolHandlerFunc {
 
 func toolSearchEmails() mcp.Tool {
 	return mcp.NewTool("search_emails",
-		mcp.WithDescription("Full-text search across email subjects and bodies, with optional metadata filters. The response includes total_count so you know how many results match in total for pagination."),
+		mcp.WithDescription("Full-text search across email subjects and bodies, with optional metadata filters. The response includes total_count so you know how many results match in total for pagination. For Chinese/Japanese/Korean queries that the FTS tokenizer cannot segment, a bounded substring scan of the most recent messages is used; scan_limited=true means older messages may not have been examined."),
 		mcp.WithTitleAnnotation("Search Emails"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(false),
 		mcp.WithString("query",
-			mcp.Description("Full-text search term. Searches across both the email subject AND the full message body (via FTS5). Leave empty to use metadata filters only."),
+			mcp.Description("Full-text search terms. Searches across both the email subject AND the full message body (via FTS5). Space-separated terms are ANDed and matched literally. Leave empty to use metadata filters only."),
 		),
 		mcp.WithString("account",
 			mcp.Description("Filter by account ID."),
@@ -587,89 +645,140 @@ func parseSearchParams(req mcp.CallToolRequest) searchParams {
 	return p
 }
 
+// buildFTSQuery turns a user query into a safe FTS5 expression.  Each
+// whitespace-separated term is quoted (so ":", "-", "*", "(" etc. are literal
+// text instead of FTS5 syntax) and the terms are joined by spaces, which FTS5
+// treats as an implicit AND.  Quoting the whole string instead would turn
+// "invoice april" into an exact phrase and silently miss most matches.
+func buildFTSQuery(query string) string {
+	fields := strings.Fields(query)
+	quoted := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.Trim(field, `"`)
+		if field == "" {
+			continue
+		}
+		quoted = append(quoted, `"`+strings.ReplaceAll(field, `"`, `""`)+`"`)
+	}
+	return strings.Join(quoted, " ")
+}
+
 func buildSearchQuery(p searchParams, cfg *config.Config) *queryBuilder {
-	return buildSearchQueryMode(p, cfg, false)
-}
-
-// buildSubstringSearchQuery builds the same query as buildSearchQuery, but
-// matches p.query as a literal substring of the subject or body instead of
-// going through the FTS5 index. See handleSearchEmails for why it exists.
-func buildSubstringSearchQuery(p searchParams, cfg *config.Config) *queryBuilder {
-	return buildSearchQueryMode(p, cfg, true)
-}
-
-func buildSearchQueryMode(p searchParams, cfg *config.Config, substring bool) *queryBuilder {
 	bodyExpr := `''`
 	if p.includeBody {
-		bodyExpr = `COALESCE((SELECT body_text FROM mail_content WHERE entry_id = e.id), '')`
+		// Fetch one extra rune so truncation is detectable without loading the
+		// entire body.
+		bodyExpr = fmt.Sprintf(
+			`COALESCE((SELECT substr(body_text, 1, %d) FROM mail_content WHERE entry_id = e.id), '')`,
+			maxSearchBodyRunes+1,
+		)
 	}
 	selectClause := `SELECT e.id, e.account_id, e.imap_folder, e.subject, e.sender, e.recipients_to, e.date_utc, e.is_read, e.is_replied, ` + fetchAttachmentsSubquery + `, ` + bodyExpr
 
 	qb := &queryBuilder{}
 	if p.query != "" {
-		if substring {
+		if maildb.HasCJK(p.query) {
+			// The auxiliary CJK index stores one token per character, so a
+			// two-character term like "通知" matches without a full LIKE scan.
 			qb.write(selectClause + `
 		FROM mail_entries e
-		WHERE ` + maildb.SubstringMatchSQL)
-			qb.args = append(qb.args, maildb.SubstringMatchArgs(p.query)...)
+		WHERE e.id IN (SELECT entry_id FROM mail_cjk_fts WHERE mail_cjk_fts MATCH ?)`)
+			qb.args = append(qb.args, maildb.CJKFTSQuery(p.query))
 		} else {
 			qb.write(selectClause + `
 		FROM mail_entries e
 		WHERE e.id IN (SELECT entry_id FROM mail_content_fts WHERE mail_content_fts MATCH ?)`)
-			// Wrap the user query in FTS5 phrase quotes so that special characters
-			// like ":", "-", "*", "(" etc. are treated as literals and not as FTS5
-			// query syntax (e.g. "Re:" would otherwise be parsed as column "Re").
-			// Any embedded double-quote must be doubled per FTS5 escaping rules.
-			qb.args = append(qb.args, `"`+strings.ReplaceAll(p.query, `"`, `""`)+`"`)
+			qb.args = append(qb.args, buildFTSQuery(p.query))
 		}
 	} else {
 		qb.write(selectClause + ` FROM mail_entries e WHERE 1=1`)
 	}
-
-	if p.account != "" {
-		qb.and("e.account_id = ?", p.account)
-	}
-	if p.subject != "" {
-		qb.and("e.subject LIKE ?", "%"+p.subject+"%")
-	}
-	if p.sender != "" {
-		qb.and("e.sender LIKE ?", "%"+p.sender+"%")
-	}
-	if p.recipient != "" {
-		qb.and("(e.recipients_to LIKE ? OR e.recipients_cc LIKE ?)", "%"+p.recipient+"%", "%"+p.recipient+"%")
-	}
-	if p.dateFrom != "" {
-		qb.and("e.date_utc >= ?", p.dateFrom)
-	}
-	if p.dateTo != "" {
-		// Normalize plain YYYY-MM-DD to end-of-day so same-day emails are included.
-		qb.and("e.date_utc <= ?", normalizeDateTo(p.dateTo))
-	}
-	if p.folder != "" {
-		qb.and("e.imap_folder = ?", p.folder)
-	}
-	if p.sentBy != "" {
-		qb.and("e.account_id = ?", p.sentBy)
-	}
-	applyAttachmentFilter(qb, p.hasAttachments)
-	if p.isRead == "true" {
-		qb.and("e.is_read = 1")
-	} else if p.isRead == "false" {
-		qb.and("e.is_read = 0")
-	}
-	applyTrashExclusions(qb, cfg)
+	appendSearchFilters(qb, p, cfg, "e")
 
 	qb.write(` ORDER BY e.date_utc DESC NULLS LAST LIMIT ? OFFSET ?`)
 	qb.args = append(qb.args, p.limit, p.offset)
 	return qb
 }
 
-func applyAttachmentFilter(qb *queryBuilder, hasAttachments string) {
+// buildSubstringSearchQuery matches p.query as a literal substring of the
+// subject or body.  FTS5 cannot segment a run of CJK characters, so this is
+// the fallback for Chinese/Japanese/Korean queries.
+//
+// The LIKE expression cannot use an index.  To keep the fallback bounded, the
+// outer query only considers the most recent substringScanLimit messages that
+// match the other filters.  scan_limited in the response tells the caller that
+// older messages were not examined.
+func buildSubstringSearchQuery(p searchParams, cfg *config.Config) *queryBuilder {
+	bodyExpr := `''`
+	if p.includeBody {
+		bodyExpr = fmt.Sprintf(
+			`COALESCE((SELECT substr(body_text, 1, %d) FROM mail_content WHERE entry_id = e.id), '')`,
+			maxSearchBodyRunes+1,
+		)
+	}
+	selectClause := `SELECT e.id, e.account_id, e.imap_folder, e.subject, e.sender, e.recipients_to, e.date_utc, e.is_read, e.is_replied, ` + fetchAttachmentsSubquery + `, ` + bodyExpr
+
+	qb := &queryBuilder{}
+	qb.write(selectClause + `
+		FROM mail_entries e
+		WHERE e.id IN (
+			SELECT e2.id FROM mail_entries e2 WHERE 1=1`)
+	appendSearchFilters(qb, p, cfg, "e2")
+	qb.write(` ORDER BY e2.date_utc DESC NULLS LAST LIMIT ?`)
+	qb.args = append(qb.args, substringScanLimit)
+	qb.write(`) AND ` + maildb.SubstringMatchSQL)
+	qb.args = append(qb.args, maildb.SubstringMatchArgs(p.query)...)
+	qb.write(` ORDER BY e.date_utc DESC NULLS LAST LIMIT ? OFFSET ?`)
+	qb.args = append(qb.args, p.limit, p.offset)
+	return qb
+}
+
+// appendSearchFilters adds the shared metadata filters for the given table
+// alias.  The CJK fallback applies them inside its bounded candidate subquery,
+// while a normal FTS search applies them directly to the outer query.
+func appendSearchFilters(qb *queryBuilder, p searchParams, cfg *config.Config, alias string) {
+	col := func(name string) string { return alias + "." + name }
+	if p.account != "" {
+		qb.and(col("account_id")+" = ?", p.account)
+	}
+	if p.subject != "" {
+		qb.and(col("subject")+" LIKE ?", "%"+p.subject+"%")
+	}
+	if p.sender != "" {
+		qb.and(col("sender")+" LIKE ?", "%"+p.sender+"%")
+	}
+	if p.recipient != "" {
+		qb.and("("+col("recipients_to")+" LIKE ? OR "+col("recipients_cc")+" LIKE ?)", "%"+p.recipient+"%", "%"+p.recipient+"%")
+	}
+	if p.dateFrom != "" {
+		qb.and(col("date_utc")+" >= ?", p.dateFrom)
+	}
+	if p.dateTo != "" {
+		// Normalize plain YYYY-MM-DD to end-of-day so same-day emails are included.
+		qb.and(col("date_utc")+" <= ?", normalizeDateTo(p.dateTo))
+	}
+	if p.folder != "" {
+		qb.and(col("imap_folder")+" = ?", p.folder)
+	}
+	if p.sentBy != "" {
+		qb.and(col("account_id")+" = ?", p.sentBy)
+	}
+	applyAttachmentFilter(qb, p.hasAttachments, alias)
+	if p.isRead == "true" {
+		qb.and(col("is_read") + " = 1")
+	} else if p.isRead == "false" {
+		qb.and(col("is_read") + " = 0")
+	}
+	applyTrashExclusions(qb, cfg, alias)
+}
+
+func applyAttachmentFilter(qb *queryBuilder, hasAttachments, alias string) {
+	id := alias + ".id"
 	switch hasAttachments {
 	case "true":
-		qb.and("EXISTS (SELECT 1 FROM mail_attachments WHERE entry_id = e.id)")
+		qb.and("EXISTS (SELECT 1 FROM mail_attachments WHERE entry_id = " + id + ")")
 	case "false":
-		qb.and("NOT EXISTS (SELECT 1 FROM mail_attachments WHERE entry_id = e.id)")
+		qb.and("NOT EXISTS (SELECT 1 FROM mail_attachments WHERE entry_id = " + id + ")")
 	}
 }
 
@@ -677,16 +786,18 @@ func applyAttachmentFilter(qb *queryBuilder, hasAttachments string) {
 // for every account that has a trash_folder configured.
 // This ensures soft-deleted emails never appear in query results, regardless of
 // whether the trash folder is included in the sync configuration.
-func applyTrashExclusions(qb *queryBuilder, cfg *config.Config) {
+func applyTrashExclusions(qb *queryBuilder, cfg *config.Config, alias string) {
 	for _, acc := range cfg.Accounts {
 		if acc.TrashFolder != "" {
-			qb.and("NOT (e.account_id = ? AND e.imap_folder = ?)", acc.ID, acc.TrashFolder)
+			qb.and("NOT ("+alias+".account_id = ? AND "+alias+".imap_folder = ?)", acc.ID, acc.TrashFolder)
 		}
 	}
 }
 
 func handleSearchEmails(db *sql.DB, cfg *config.Config) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ctx, cancel := queryCtx(ctx)
+		defer cancel()
 		p := parseSearchParams(req)
 		slog.Info("tool called", "tool", "search_emails", "query", p.query, "account", p.account, "sender", p.sender, "date_from", p.dateFrom, "date_to", p.dateTo, "limit", p.limit, "offset", p.offset)
 		if msg := validateHasAttachments(p.hasAttachments); msg != "" {
@@ -701,31 +812,48 @@ func handleSearchEmails(db *sql.DB, cfg *config.Config) server.ToolHandlerFunc {
 		if msg := validateDate("date_to", p.dateTo); msg != "" {
 			return mcp.NewToolResultError(msg), nil
 		}
-		qb := buildSearchQuery(p, cfg)
+		cjkQuery := p.query != "" && maildb.HasCJK(p.query)
+		// While the auxiliary CJK index is still being backfilled it can match
+		// *some* rows and miss others.  Returning that partial set as a normal
+		// result would silently hide older mail, so use the bounded substring
+		// scan (which reports scan_limited) until every folder is backfilled.
+		usedFallback := cjkQuery && maildb.CJKIndexPending(db)
+		var qb *queryBuilder
+		if usedFallback {
+			qb = buildSubstringSearchQuery(p, cfg)
+		} else {
+			qb = buildSearchQuery(p, cfg)
+		}
 		results, total, err := runSearchQuery(ctx, db, qb)
 		if err != nil {
 			return mcp.NewToolResultError(fmtDBError(err)), nil
 		}
 
-		// FTS5's tokenizer turns a run of CJK characters into a single term, so a
-		// keyword like "通知" never matches a subject like "关于…的通知". When such
-		// a query finds nothing at all, retry it as a literal substring scan.
-		if total == 0 && p.query != "" && maildb.HasCJK(p.query) {
+		// A CJK row inserted after the backfill pass (or a query the index
+		// tokenised differently) can still miss.  Fall back when it finds
+		// nothing, even though the index is otherwise complete.
+		if !usedFallback && cjkQuery && total == 0 {
 			fallback := buildSubstringSearchQuery(p, cfg)
 			results, total, err = runSearchQuery(ctx, db, fallback)
 			if err != nil {
 				return mcp.NewToolResultError(fmtDBError(err)), nil
 			}
-			slog.Info("search_emails: no FTS5 match, used substring fallback",
-				"query", p.query, "total", total)
+			usedFallback = true
+			slog.Info("search_emails: no FTS5 match, used bounded substring fallback",
+				"query", p.query, "total", total, "scan_limit", substringScanLimit)
 		}
 
-		out, _ := json.MarshalIndent(pagedResult[searchResult]{
+		page := pagedResult[searchResult]{
 			TotalCount: total,
 			Offset:     p.offset,
 			Limit:      p.limit,
 			Results:    results,
-		}, "", "  ")
+		}
+		if usedFallback {
+			page.ScanLimited = true
+			page.ScanLimit = substringScanLimit
+		}
+		out, _ := json.MarshalIndent(page, "", "  ")
 		return mcp.NewToolResultText(string(out)), nil
 	}
 }
@@ -733,7 +861,8 @@ func handleSearchEmails(db *sql.DB, cfg *config.Config) server.ToolHandlerFunc {
 // searchResult is one hit returned by the search_emails tool.
 type searchResult struct {
 	mailSummary
-	BodyText string `json:"body_text,omitempty"`
+	BodyText      string `json:"body_text,omitempty"`
+	BodyTruncated bool   `json:"body_truncated,omitempty"`
 }
 
 // runSearchQuery executes qb and returns the requested page of results together
@@ -769,6 +898,7 @@ func runSearchQuery(ctx context.Context, db *sql.DB, qb *queryBuilder) ([]search
 		if err := json.Unmarshal([]byte(attJSON), &m.Attachments); err != nil {
 			m.Attachments = []attachmentDetail{}
 		}
+		m.BodyText, m.BodyTruncated = truncateRunes(m.BodyText, maxSearchBodyRunes)
 		results = append(results, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -935,7 +1065,7 @@ func handleGetDownloadLink(cfg *config.Config, fs *fileserver.Server) server.Too
 
 func toolGetThread() mcp.Tool {
 	return mcp.NewTool("get_thread",
-		mcp.WithDescription("Returns all emails belonging to the same thread as the given email, sorted by date ascending. Uses message-id and in-reply-to headers to find related messages. Note: emails synced before this feature was added may have NULL thread headers and will not appear in thread results until the background envelope backfill completes."),
+		mcp.WithDescription("Returns all emails belonging to the same thread as the given email, sorted by date ascending. Uses message-id and in-reply-to headers to find related messages. Returns at most the first 500 messages of a very large thread (oldest first); later messages are omitted. Note: emails synced before this feature was added may have NULL thread headers and will not appear in thread results until the background envelope backfill completes."),
 		mcp.WithTitleAnnotation("Get Email Thread"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
@@ -950,6 +1080,8 @@ func toolGetThread() mcp.Tool {
 
 func handleGetThread(db *sql.DB, cfg *config.Config) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ctx, cancel := queryCtx(ctx)
+		defer cancel()
 		emailID, err := req.RequireString("email_id")
 		if err != nil {
 			return mcp.NewToolResultError("email_id is required"), nil
@@ -988,7 +1120,8 @@ func handleGetThread(db *sql.DB, cfg *config.Config) server.ToolHandlerFunc {
 		if len(trashConds) > 0 {
 			query += " WHERE " + strings.Join(trashConds, " AND ")
 		}
-		query += " ORDER BY e.date_utc ASC NULLS LAST"
+		query += " ORDER BY e.date_utc ASC NULLS LAST LIMIT ?"
+		threadArgs = append(threadArgs, maxThreadMessages+1)
 
 		rows, err := db.QueryContext(ctx, query, threadArgs...)
 		if err != nil {
@@ -1024,6 +1157,10 @@ func handleGetThread(db *sql.DB, cfg *config.Config) server.ToolHandlerFunc {
 		}
 		if err := rows.Err(); err != nil {
 			slog.Warn("get_thread: row iteration error", "err", err)
+		}
+		if len(results) > maxThreadMessages {
+			slog.Warn("get_thread: thread truncated", "email_id", emailID, "limit", maxThreadMessages)
+			results = results[:maxThreadMessages]
 		}
 		if results == nil {
 			results = []mailSummary{}
@@ -1133,6 +1270,9 @@ func handleDeleteMail(cfg *config.Config, db *sql.DB) server.ToolHandlerFunc {
 		// then mail_entries (which cascades to mail_attachments).
 		if _, err := db.ExecContext(ctx, `DELETE FROM mail_content_fts WHERE entry_id = ?`, emailID); err != nil {
 			slog.Warn("delete_mail: failed to remove FTS entry", "email_id", emailID, "err", err)
+		}
+		if _, err := db.ExecContext(ctx, `DELETE FROM mail_cjk_fts WHERE entry_id = ?`, emailID); err != nil {
+			slog.Warn("delete_mail: failed to remove CJK index entry", "email_id", emailID, "err", err)
 		}
 		if _, err := db.ExecContext(ctx, `DELETE FROM mail_content WHERE entry_id = ?`, emailID); err != nil {
 			slog.Warn("delete_mail: failed to remove content entry", "email_id", emailID, "err", err)

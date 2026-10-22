@@ -89,6 +89,10 @@ func collectText(dec *mime.WordDecoder, header textproto.MIMEHeader, body io.Rea
 	}
 
 	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+		// A multipart/alternative carries the same content twice (text/plain
+		// and text/html).  Return only the first usable alternative instead of
+		// concatenating both.
+		preferFirst := strings.EqualFold(mediaType, "multipart/alternative")
 		boundary := params["boundary"]
 		if boundary == "" {
 			data, err := io.ReadAll(body)
@@ -105,9 +109,14 @@ func collectText(dec *mime.WordDecoder, header textproto.MIMEHeader, body io.Rea
 			if err != nil {
 				break // io.EOF or a broken boundary — keep what we already have
 			}
-			if text := collectText(dec, part.Header, part, attachments, depth+1); text != "" {
-				parts = append(parts, text)
+			text := collectText(dec, part.Header, part, attachments, depth+1)
+			if text == "" {
+				continue
 			}
+			if preferFirst {
+				return text
+			}
+			parts = append(parts, text)
 		}
 		return strings.Join(parts, "\n")
 	}
@@ -122,12 +131,16 @@ func collectText(dec *mime.WordDecoder, header textproto.MIMEHeader, body io.Rea
 		return ""
 	}
 
-	if strings.EqualFold(mediaType, "text/plain") {
+	if strings.EqualFold(mediaType, "text/plain") || strings.EqualFold(mediaType, "text/html") {
 		data, err := io.ReadAll(body)
 		if err != nil {
 			return ""
 		}
-		return strings.TrimSpace(decodeBody(data, header.Get("Content-Transfer-Encoding")))
+		text := strings.TrimSpace(decodeBody(data, header.Get("Content-Transfer-Encoding")))
+		if strings.EqualFold(mediaType, "text/html") {
+			text = strings.TrimSpace(htmlToText(text))
+		}
+		return text
 	}
 
 	return ""

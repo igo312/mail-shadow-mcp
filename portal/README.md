@@ -161,6 +161,7 @@ portal ──Docker socket / CLI──▶ Docker
 - MCP token：`HMAC(master_key, "mcp-token" + token_salt + NUL + email + NUL + password)`，再 base64url。
 - `token_salt` 是每个实例独立的随机值；同一实例、同一凭据会得到同一个 token，修改授权码或删除后重建会轮换 salt，因此旧 token 不会被“恢复”。
 - 控制数据库只保存幂等键、salt 和 token 的哈希，**不保存授权码，也不保存明文 token**。token 不从未经加密的幂等键推导，因此即使控制数据库和 master key 一起泄露，也不能直接重建现有 token。
+- **一个邀请码可以创建多个实例**：`max_uses` 限制的是邀请码被兑换成会话的次数，不是邮箱数量；同一个会话可以继续添加多个邮箱（受全局 `MSM_MAX_INSTANCES` 限制）。实例通过 `owner_invite` 记录归属，同一邀请码创建的实例都可以在该会话的结果页查看，其他邀请码的会话看不到。
 - 同一对 `(email, password)` 再次提交（实例仍存在）：
   - 不会创建第二个容器；
   - 不会重新同步；
@@ -238,6 +239,7 @@ python -m app
 - portal 直接调用宿主机的 Docker；
 - 每个实例创建时用 `-p 127.0.0.1::8080` 让 Docker 分配一个**只绑定 loopback 的随机端口**；
 - portal 通过 `127.0.0.1:<随机端口>` 转发 `/mcp`；
+- **`port`/`ip` 模式每次转发前都会用 `docker inspect` 读取容器当前的端口/IP**，不会使用控制数据库里可能过期的 `host_port`。Docker 会在容器删除后立刻复用宿主机端口，只信数据库会把 A 的 token 转发到 B 的容器；现在如果容器已停止、消失或 `msm.instance` label 不匹配，网关直接返回 502，而不是冒险转发。`network` 模式靠 Docker DNS 和唯一的容器名解析，不经过宿主端口，因此不做这次 inspect；
 - 容器使用 Docker 默认 bridge，不需要 `msm-net`；
 - 这个随机端口不对外网开放，公网仍然只有 portal 的一个端口；
 - Linux、Windows Docker Desktop、macOS Docker Desktop 都可以用。
@@ -259,6 +261,41 @@ mcp.example.com {
 ```bash
 python cli.py invite create --label "alice" --uses 1 --days 7
 ```
+
+### 不打扰用户，升级已有实例
+
+新镜像/新配置（例如只同步 INBOX）不需要用户重新提交邮箱授权码。`reconcile` 会从每个实例的 config 卷读回授权码和当前 token，用同一个 token、同一个 data 卷重建容器：
+
+```bash
+# 1. 先拉取/构建新镜像，并确保 MSM_IMAGE 指向它
+export MSM_IMAGE="ghcr.io/dryas/mail-shadow-mcp:latest"
+docker pull "$MSM_IMAGE"
+
+# 2. 先预演，确认哪些实例需要重建
+python cli.py instance reconcile --all --dry-run
+
+# 3. 真正执行；每个实例会有几秒 503，随后恢复
+#    默认只升级镜像，完全不改现有 config（文件夹/trash 行为保持原样）
+python cli.py instance reconcile --all
+
+# 4. 如果确实要把已有实例改成只同步 INBOX / 配置 trash_folder，
+#    在确认 MSM_SYNC_FOLDERS / MSM_TRASH_FOLDER 后加 --update-config
+python cli.py instance reconcile --all --update-config
+
+# 只处理一个实例
+python cli.py instance reconcile --id <instance-id> [--update-config]
+```
+
+行为：
+
+- 读取 `msm-config-<id>` 卷里的 `config.yaml`，保留原来的邮箱授权码和 **MCP token**；客户端配置不需要改。
+- 默认只换镜像：复用 config 卷原文，**不会**改变现有实例的文件夹/trash 行为。
+- 加 `--update-config` 才用当前 `MSM_SYNC_FOLDERS` / `MSM_TRASH_FOLDER` 重新生成 config；`msm-data-<id>` 数据卷不动。
+- 镜像 ID 和 config 都没变化时自动跳过；`--force` 可强制重建。
+- 容器规格（内存/CPU/PID 上限、GOMEMLIMIT/GOGC/GOMAXPROCS、TMPDIR 等）也会参与比对：旧容器没有 `msm.spec` label，或规格与当前配置不同时会重建。因此升级到 4GB/100 实例的内存配置时，即使镜像 tag 没变，也会应用新的 128m/GOMEMLIMIT 设置。
+- 如果 config 里的 token 与控制库的路由哈希不一致（例如上次轮换在写 config 前失败），会以 config 为准修复控制库哈希，现有客户端 token 继续可用。
+- 读不到授权码、token 与控制库不一致、或新镜像写入 config 失败时，**不会删除旧容器**，旧实例继续服务；修复后再执行一次即可。
+- 重建期间实例状态变为 `updating`/`provisioning`，网关返回 503，不会把请求转给别的容器。
 
 #### 用 supervisor 守护（Linux）
 
@@ -321,7 +358,7 @@ cp .env.example .env
 MSM_PUBLIC_URL=https://mcp.example.com
 MSM_DOMAIN=mcp.example.com
 MSM_IMAGE=ghcr.io/dryas/mail-shadow-mcp:latest
-MSM_MAX_INSTANCES=25
+MSM_MAX_INSTANCES=100
 ```
 
 #### 3. 启动（带自动 HTTPS）
@@ -371,6 +408,77 @@ expires:   2026-10-28 10:00
 
 ---
 
+## 100 个实例的容量说明
+
+代码默认 `MSM_MAX_INSTANCES=0`（不限制），但 4GB 档的部署示例都设为 **100**：100 是 4GB 的容量规划值，设成硬上限才能在超卖时拒绝新实例，而不是让宿主 OOM。内存更大的宿主可以调高或设为 0。
+
+控制面在 100 个实例下的设计：
+
+- **网关解析目标容器**：`port`/`ip` 模式不再为每个 MCP 请求启动一次 `docker inspect` 子进程，而是优先走 Docker Unix socket HTTP API（默认 `/var/run/docker.sock`，可用 `MSM_DOCKER_SOCKET` 指定），单次约 1–4ms；远程 daemon/Windows context 自动回退到 CLI。
+- **控制库**：SQLite WAL，令牌查找走 `token_hash` 唯一索引；单连接 + 锁保护，令牌查找/`last_seen` 更新都是微秒级。
+- **实例隔离**：每个实例仍有自己的 SQLite 数据库、同步引擎和容器；100 个实例之间互不共享数据库连接。
+- **数据面**：所有用户仍只暴露一个公网端口，靠 Bearer token 路由；不需要为 100 个实例开 100 个公网端口。
+- **扩容方式**：加内存/CPU/磁盘即可；如果需要更高并发，优先改用 `MSM_BACKEND_MODE=network`（走 Docker DNS，不经过宿主机端口映射），或把 portal 放到更强的机器。
+
+需要按宿主机资源估算：
+
+| 资源 | 100 实例估算 |
+|---|---|
+| 内存 | 100 × `MSM_CONTAINER_MEMORY` 是 cgroup **上限之和**，不是预留；128m 时上限和约 12.8GB，但实际目标 25–35MB/容器 |
+| 磁盘 | 每个实例的 SQLite + FTS/CJK 索引 + 附件；按邮箱大小 × 100 |
+| 文件描述符 | 100 个容器、portal 的 SSE 连接、Docker socket；建议 `ulimit -n` ≥ 65535 |
+| Docker | 100 个容器、100 个 loopback 端口（port 模式）或 100 个 bridge IP（network 模式） |
+
+单 portal 进程可以服务 100 个实例；如果后续要到数百个，建议把网关/控制面做成多副本或按租户分片，因为限流器和控制库目前是单实例设计。
+
+### 4GB 宿主的 100 实例内存预算
+
+一组可落地的默认值（本仓库默认已按此设置）：
+
+- 容器 cgroup 上限：`MSM_CONTAINER_MEMORY=128m`；这是上限，不是预留。
+- Go 堆：`GOMEMLIMIT=48MiB`、`GOGC=50`、`GOMAXPROCS=1`。
+- SQLite：最多 2 个连接，每连接 4MB page cache，`temp_store=FILE`、`mmap_size=0`。
+- SQLite 临时文件/排序溢出：`TMPDIR=/data/tmp`、`SQLITE_TMPDIR=/data/tmp`，不占 8MB 的 `/tmp` tmpfs。
+- 单封邮件入库正文上限 256KB；CJK 索引同样最多 256KB；raw fallback 8MB；单附件 16MB。
+- 同步窗口 50 封，但正文是**逐封提取后立即截断**，不会把 50 封的原始 HTML 同时留在内存里（一封 5MB 的 newsletter 不会变成 250MB 峰值）。
+- 100 个容器**重启**时 initial sync/IDLE 连接随机抖动最多 15 分钟，避免同时拉满内存；**全新实例第一次同步不抖动**，用户提交后立即可见。
+- 轮询间隔默认 30 分钟；INBOX 的 IDLE 仍然即时。
+
+粗算：
+
+| 项目 | 估算 |
+|---|---|
+| OS + Docker daemon | 0.5–0.8GB |
+| portal + Caddy | 50–100MB |
+| 100 个实例 | 目标 25–35MB/个 ≈ 2.5–3.5GB |
+| 合计 | 约 3.0–4.4GB，需要按实际邮件量观察 |
+
+**4GB 档请保持 `MSM_MAX_INSTANCES=100`**（本仓库的 `.env.example`、compose 和 supervisor 示例已设为 100）。它不会降低单实例上限，但能防止第 101 个用户悄悄把宿主推过 4GB；`0`（不限制）只适合内存更大的宿主。
+
+`25–35MB/个` 是目标值，不是强制值：真正硬限制只有 cgroup 的 128m，`GOMEMLIMIT` 是软限制。首次上线後请用下面的脚本在**所有实例完成初次同步后**实测一次，而不是只看 `docker stats` 的 LIMIT 列：
+
+```bash
+python3 deploy/memory-report.py --budget-mb 4096
+```
+
+脚本会打印实例数、实际 USAGE 总和、宿主可用内存和余量；余量小于 10% 时按下面的顺序调低。如果 `docker stats` 显示总和接近 4GB：
+
+1. `MSM_CONTAINER_GOMEMLIMIT=32MiB`；
+2. `MSM_CONTAINER_MEMORY=96m`；
+3. `MSM_SYNC_INTERVAL_MIN=60`；
+4. 减少 `MSM_CONTAINER_CPUS`（例如 0.5）以降低同时运行的同步 CPU 竞争；
+5. 对特别大的邮箱，先用 `MSM_SYNC_FOLDERS` 限制只同步 INBOX。
+
+监控命令：
+
+```bash
+docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}' | grep msm-
+```
+
+注意：`docker stats` 的 `LIMIT` 是 cgroup 上限；只有 `USAGE` 计入宿主实际内存。100 个容器的 LIMIT 之和超过 4GB 是正常的，关键是 USAGE 之和 + 系统进程不超过宿主内存。
+
+---
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -386,10 +494,18 @@ expires:   2026-10-28 10:00
 | `MSM_BACKEND_MODE` | `port` | `port`：宿主机直接运行 portal（推荐）；`network`：portal 与实例同处一个 Docker 网络（compose）；`ip`：Linux 宿主机通过容器 IP 访问 |
 | `MSM_BACKEND_PORT` | `8080` | 实例内部 MCP 端口（一般不用改） |
 | `MSM_VERIFY_BACKEND` | `1` | 启动后探测 `/mcp` 是否返回 401 |
-| `MSM_MAX_INSTANCES` | `25` | 同时存在的实例上限 |
-| `MSM_CONTAINER_MEMORY` | `512m` | 每个实例内存上限 |
+| `MSM_MAX_INSTANCES` | `0`（代码默认）；部署示例为 `100` | 同时存在的实例上限；`0` = 不限制。4GB 宿主请保持 `100`：单实例上限仍是 128m，但总数被封顶后可用内存才是可预测的。100 × `MSM_CONTAINER_MEMORY` 是上限之和，不是预留 |
+| `MSM_CONTAINER_MEMORY` | `128m` | 每个实例 cgroup 内存上限（不是预留；100 个实例的上限之和可以大于宿主内存，实际看 `docker stats`） |
 | `MSM_CONTAINER_CPUS` | `1.0` | 每个实例 CPU 上限 |
-| `MSM_CONTAINER_PIDS` | `256` | 每个实例 PID 上限 |
+| `MSM_CONTAINER_PIDS` | `128` | 每个实例 PID 上限；`GOMAXPROCS=1` 下足够 |
+| `MSM_CONTAINER_GOMEMLIMIT` | `48MiB` | 传给容器的 `GOMEMLIMIT`，让 Go 在 4GB 宿主上更早 GC |
+| `MSM_CONTAINER_GOGC` | `50` | 传给容器的 `GOGC`，降低堆峰值（CPU 换内存） |
+| `MSM_CONTAINER_GOMAXPROCS` | `1` | 每个实例一个 P，减少线程/调度开销 |
+| `MSM_SYNC_INTERVAL_MIN` | `30` | 实例轮询间隔；IDLE 仍会对 INBOX 即时推送。调大可进一步降低 100 实例的同步峰值 |
+| `MSM_SYNC_JITTER_SEC` | `1800` | **已有同步数据的实例**重启/IDLE 重连时，初始同步最多随机延迟多少秒；全新实例第一次同步不延迟。实际上限为 `min(SYNC_INTERVAL_MIN/2, 该值)`，所以 30 分钟间隔下最大 15 分钟 |
+| `MSM_SYNC_FOLDERS` | `INBOX` | 每个实例同步的 IMAP 文件夹，逗号分隔；默认只同步 `INBOX`，避免把「所有邮件」/垃圾箱/大附件历史全部拉进每个用户的数据库。需要 Sent/Archive 时设为 `INBOX,Sent` 等；设为 `ALL` 可同步全部（不推荐） |
+| `MSM_GATEWAY_TIMEOUT` | `120` | 网关等待实例响应头的秒数；MCP 工具调用超过该值会返回 502 |
+| `MSM_TRASH_FOLDER` | 空 | 为每个实例配置 `delete_mail` 的软删除目标文件夹（必须在邮件服务器上已存在，例如 `llm_delete`）。为空时 `delete_mail` 工具会返回「未配置」错误 |
 | `MSM_SESSION_TTL` | `7200` | 邀请码会话有效期（秒） |
 | `MSM_FLASH_TTL` | `900` | 结果页 Token 显示窗口（秒） |
 | `MSM_INVITE_RATE_LIMIT` / `_WINDOW` | `12` / `900` | 每 IP 邀请码尝试限制 |

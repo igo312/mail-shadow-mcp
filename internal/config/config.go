@@ -27,6 +27,7 @@ type DatabaseConfig struct {
 type Config struct {
 	Database        DatabaseConfig  `yaml:"database"`
 	SyncIntervalMin int             `yaml:"sync_interval_min"`
+	SyncJitterSec   int             `yaml:"sync_jitter_sec"`    // max random delay before initial sync (default 300)
 	AttachmentDir   string          `yaml:"attachment_dir"`     // base directory for downloaded attachments
 	FileServerPort  int             `yaml:"fileserver_port"`    // 0 = disabled; set to e.g. 8787 to enable
 	FileServerTTL   int             `yaml:"fileserver_ttl_min"` // minutes before a download link expires (default 15)
@@ -79,6 +80,13 @@ func Load(path string) (*Config, error) {
 		cfg.SyncIntervalMin = 15
 	} else if cfg.SyncIntervalMin < 5 {
 		cfg.SyncIntervalMin = 5
+	}
+
+	if cfg.SyncJitterSec <= 0 {
+		cfg.SyncJitterSec = 300
+	}
+	if cfg.SyncJitterSec > 3600 {
+		cfg.SyncJitterSec = 3600
 	}
 
 	// Apply attachment dir default

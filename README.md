@@ -241,7 +241,7 @@ The AI agent has no direct IMAP access. It cannot expunge messages, empty folder
 - **Read-only sync** — the sync engine only issues read commands (`SELECT`, `UID FETCH`); no `STORE`, `APPEND`, or `EXPUNGE` is ever sent to your mail server
 - **Incremental sync** — only fetches messages newer than the last known UID
 - **Fault-tolerant sync** — a message the server sends in a form the IMAP decoder rejects cannot stall the mailbox; it is isolated, recovered from the raw message, or quarantined
-- **Full-text search** — SQLite FTS5 index for fast body-text queries; queries FTS5 cannot segment (Chinese, Japanese, Korean) automatically fall back to a substring match on subject and body
+- **Full-text search** — SQLite FTS5 index for fast body-text queries, plus an auxiliary CJK index that tokenizes each Chinese/Japanese/Korean character. Two-character CJK terms such as “通知” are indexed directly instead of scanning the table. Existing mail is backfilled incrementally; until a folder's backfill finishes, CJK queries use the bounded substring scan and set `scan_limited=true` in the response, so an incomplete index can never look like a complete result.
 - **Multi-account** — sync any number of IMAP accounts simultaneously
 - **IMAP IDLE** — optional real-time push notifications; new mail detected within seconds instead of waiting for the next poll interval
 - **Read/replied status** — `is_read` and `is_replied` flags synced from IMAP and exposed as filters
@@ -416,13 +416,16 @@ The sync therefore runs two phases:
    hundred bytes.
 2. **Text** — the `text/plain` parts selected from that structure, fetched with
    `BODY.PEEK[n]` and grouped so messages needing the same part share one
-   command. HTML-only and attachment-only mail contributes no body at all
-   instead of a payload.
+   command. When a message has no text/plain part, a text/html part is fetched
+   instead and reduced to plain text (tags/scripts removed). Attachment-only
+   mail contributes no body. Stored/indexed body text is capped at 256 KB per
+   message to keep the 128 MB container profile predictable.
 
 Attachment *metadata* (filename, MIME type, size) is still read from
 `BODYSTRUCTURE` and stored in `mail_attachments`, so `download_attachments` and
 `get_download_link` keep working — the bytes are fetched from IMAP only when one
-of those tools is called.
+of those tools is called. A single attachment larger than 16 MB is skipped
+rather than buffered twice in a small container.
 
 A sync that stops delivering anything for 60 s is treated as a dead connection
 rather than waiting forever: the socket is closed and the window is retried and,

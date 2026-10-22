@@ -17,7 +17,14 @@ from urllib.parse import urlsplit
 
 from .config import Config
 from .db import Database
-from .docker_cli import DockerClient, DockerError
+from .docker_cli import (
+    DockerClient,
+    DockerError,
+    container_ip_from_info,
+    container_is_running,
+    host_port_from_info,
+    instance_label,
+)
 from .security import RateLimiter, TokenService
 
 log = logging.getLogger(__name__)
@@ -51,8 +58,6 @@ class Gateway:
         self.limiter = limiter
         self._touch_lock = threading.Lock()
         self._last_touch: dict[str, float] = {}
-        self._ip_cache: dict[str, tuple[str, float]] = {}
-        self._ip_cache_lock = threading.Lock()
 
     def handles(self, path: str) -> bool:
         return urlsplit(path).path in {"/mcp", "/mcp/"}
@@ -119,7 +124,9 @@ class Gateway:
         connection: http.client.HTTPConnection | None = None
         headers_sent = False
         try:
-            connection = http.client.HTTPConnection(target_host, target_port, timeout=30)
+            connection = http.client.HTTPConnection(
+                target_host, target_port, timeout=self.config.gateway_timeout_seconds
+            )
             connection.request(handler.command, "/mcp", body=body, headers=headers)
             response = connection.getresponse()
             # Server-sent events (and long-lived StreamableHTTP streams) must
@@ -170,25 +177,58 @@ class Gateway:
 
     # -- helpers ---------------------------------------------------------
     def _backend_target(self, instance: dict[str, Any]) -> tuple[str, int] | None:
+        """Resolve the live backend for an instance.
+
+        The control database is only a *routing index*, never the source of
+        truth for a host port or container IP.  Docker assigns random loopback
+        ports and reuses them immediately after a container is removed, so a
+        stale ``instances.host_port`` can point at another user's container.
+        Always inspect the named container and use its current address.
+
+        The container name is derived from the immutable instance id and the
+        container carries an ``msm.instance`` label.  If the label does not
+        match, refuse to route rather than trusting a name collision.
+        """
+        name = str(instance["container_name"])
         if self.config.backend_mode == "network":
-            return str(instance["container_name"]), self.config.backend_port
+            # Docker's embedded DNS resolves the network alias and Docker
+            # guarantees a unique container name; no port publishing involved.
+            return name, self.config.backend_port
+
+        info = self.docker.inspect_container(name)
+        if not info:
+            return None
+        if not container_is_running(info):
+            return None
+        owner = instance_label(info)
+        if owner and owner != str(instance["id"]):
+            log.error(
+                "refusing to route instance %s: container %s belongs to %s",
+                instance["id"],
+                name,
+                owner,
+            )
+            return None
+
         if self.config.backend_mode == "port":
-            host_port = int(instance.get("host_port") or 0)
+            host_port = host_port_from_info(info, self.config.backend_port)
             if not host_port:
                 return None
+            # Keep the control database in sync for diagnostics, but the value
+            # used for this request came from Docker, not from the database.
+            if int(instance.get("host_port") or 0) != host_port:
+                try:
+                    self.db.set_instance_host_port(instance["id"], host_port)
+                except Exception:
+                    log.debug("could not update host_port for %s", instance["id"], exc_info=True)
             return "127.0.0.1", host_port
 
-        name = str(instance["container_name"])
-        now = time.monotonic()
-        with self._ip_cache_lock:
-            cached = self._ip_cache.get(name)
-            if cached and cached[1] > now:
-                return cached[0], self.config.backend_port
-        ip = self.docker.container_ip(name, self.config.docker_network) or ""
-        if ip:
-            with self._ip_cache_lock:
-                self._ip_cache[name] = (ip, now + 30)
+        if self.config.backend_mode == "ip":
+            ip = container_ip_from_info(info, self.config.docker_network)
+            if not ip:
+                return None
             return ip, self.config.backend_port
+
         return None
 
     def _touch(self, instance_id: str) -> None:

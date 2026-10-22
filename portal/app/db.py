@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS invites (
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS instances (
     tls_mode       TEXT NOT NULL,
     provider_key   TEXT NOT NULL DEFAULT '',
     provider_name  TEXT NOT NULL DEFAULT '',
+    owner_invite   TEXT NOT NULL DEFAULT '',
     status         TEXT NOT NULL,
     last_error     TEXT,
     created_at     INTEGER NOT NULL,
@@ -98,6 +99,10 @@ class Database:
             if "host_port" not in columns:
                 self._conn.execute(
                     "ALTER TABLE instances ADD COLUMN host_port INTEGER NOT NULL DEFAULT 0"
+                )
+            if "owner_invite" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE instances ADD COLUMN owner_invite TEXT NOT NULL DEFAULT ''"
                 )
             current = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if current < SCHEMA_VERSION:
@@ -186,9 +191,11 @@ class Database:
     def list_invites(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                """SELECT id, label, max_uses, uses, expires_at, disabled,
-                          created_at, last_used_at
-                   FROM invites ORDER BY created_at DESC"""
+                """SELECT i.id, i.label, i.max_uses, i.uses, i.expires_at, i.disabled,
+                          i.created_at, i.last_used_at,
+                          (SELECT COUNT(*) FROM instances
+                            WHERE owner_invite = i.id AND status != 'removed') AS mailbox_count
+                   FROM invites i ORDER BY i.created_at DESC"""
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -233,34 +240,80 @@ class Database:
                 ).fetchone()[0]
             )
 
-    def insert_instance(self, record: dict[str, Any]) -> None:
-        keys = (
-            "id",
-            "email",
-            "idem_hash",
-            "token_hash",
-            "token_salt",
-            "container_name",
-            "config_volume",
-            "data_volume",
-            "host_port",
-            "imap_host",
-            "imap_port",
-            "tls_mode",
-            "provider_key",
-            "provider_name",
-            "status",
-            "last_error",
-            "created_at",
-            "updated_at",
-        )
+    _INSTANCE_KEYS = (
+        "id",
+        "email",
+        "idem_hash",
+        "token_hash",
+        "token_salt",
+        "container_name",
+        "config_volume",
+        "data_volume",
+        "host_port",
+        "imap_host",
+        "imap_port",
+        "tls_mode",
+        "provider_key",
+        "provider_name",
+        "owner_invite",
+        "status",
+        "last_error",
+        "created_at",
+        "updated_at",
+    )
+
+    def _insert_instance_row(self, record: dict[str, Any]) -> None:
+        keys = self._INSTANCE_KEYS
         values = [record.get(key) for key in keys]
         values[keys.index("host_port")] = record.get("host_port") or 0
+        values[keys.index("owner_invite")] = record.get("owner_invite") or ""
+        self._conn.execute(
+            f"INSERT INTO instances ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
+            values,
+        )
+
+    def insert_instance(self, record: dict[str, Any]) -> None:
         with self._lock:
-            self._conn.execute(
-                f"INSERT INTO instances ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
-                values,
+            self._insert_instance_row(record)
+
+    def count_instances_for_invite(self, invite_id: str) -> int:
+        with self._lock:
+            return int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM instances WHERE owner_invite = ? AND status != 'removed'",
+                    (invite_id,),
+                ).fetchone()[0]
             )
+
+    def reserve_instance(self, record: dict[str, Any], max_instances: int) -> str:
+        """Insert a new instance only if capacity is still available.
+
+        The count check and insert happen in one BEGIN IMMEDIATE transaction so
+        two concurrent sign-ups cannot both observe ``count == max-1`` and
+        overshoot the deployment limit.  Container creation happens later,
+        outside this lock; the reserved row already counts against capacity.
+
+        Returns ``"ok"`` or ``"capacity"``.  There is deliberately no per-invite
+        mailbox cap: one invite may create multiple instances; ``max_uses``
+        limits invite redemptions/sessions, not mailboxes.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                count = int(
+                    self._conn.execute(
+                        "SELECT COUNT(*) FROM instances WHERE status != 'removed'"
+                    ).fetchone()[0]
+                )
+                if max_instances > 0 and count >= max_instances:
+                    self._conn.execute("ROLLBACK")
+                    return "capacity"
+                self._insert_instance_row(record)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return "ok"
 
     def update_instance_credentials(
         self,
@@ -319,6 +372,21 @@ class Database:
                            updated_at = ? WHERE id = ?""",
                     (status, error, now(), instance_id),
                 )
+
+    def set_instance_owner(self, instance_id: str, invite_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE instances SET owner_invite = ?, updated_at = ? WHERE id = ?",
+                (invite_id, now(), instance_id),
+            )
+
+    def set_instance_token_hash(self, instance_id: str, token_hash: str) -> None:
+        """Repair the routing hash to match the credential in the config volume."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE instances SET token_hash = ?, updated_at = ? WHERE id = ?",
+                (token_hash, now(), instance_id),
+            )
 
     def set_instance_host_port(self, instance_id: str, host_port: int) -> None:
         with self._lock:

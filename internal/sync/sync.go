@@ -38,27 +38,32 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"math"
 	"mime/quotedprintable"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 
 	"github.com/dryas/mail-shadow-mcp/internal/config"
+	maildb "github.com/dryas/mail-shadow-mcp/internal/db"
 )
 
 const (
 	// syncWindowSize is the number of UIDs requested per FETCH command.
-	// Small windows bound the work lost when a connection dies mid-stream and
-	// make the bisection that isolates an unparsable message cheap.
-	syncWindowSize = 100
+	// 50 keeps peak memory bounded on a 128 MB instance while still amortising
+	// IMAP round-trips; the old 100-message window could hold tens of MB of
+	// decoded bodies at once.
+	syncWindowSize = 50
 
 	// fetchAttempts is how often a window is retried on a transient failure
 	// before it is bisected. Decode errors are never retried: they are
@@ -67,13 +72,27 @@ const (
 
 	// rawMessageLimit caps the size of a message fetched as a single literal in
 	// the fallback path. Bigger messages are quarantined instead of buffered.
-	rawMessageLimit = 32 << 20
+	rawMessageLimit = 8 << 20
+
+	// maxStoredBodyBytes caps the body text written to mail_content / FTS / the
+	// CJK index.  The agent only receives the first 20k runes anyway, and a
+	// 256 KB cap keeps a 50-message fetch window well inside a 128 MB container.
+	maxStoredBodyBytes = 256 << 10
 
 	// fetchStallTimeout is how long a FETCH may go without delivering anything
 	// before the connection is considered dead. Some servers accept a command
 	// and then answer nothing at all (they close the socket minutes later);
 	// go-imap has no read deadline, so without this the sync waits forever.
 	fetchStallTimeout = 60 * time.Second
+
+	// bulkImportThreshold is the number of pending UIDs above which FTS
+	// auto-merge is disabled for the duration of the folder sync.  Small
+	// incremental syncs keep auto-merge on and do no explicit compaction.
+	bulkImportThreshold = 2 * syncWindowSize
+
+	// ftsMergePages bounds the FTS5 merge work done after a bulk import.
+	// Smaller pages keep FTS5's transient memory low on dense Chinese indexes.
+	ftsMergePages = 100
 )
 
 // Client wraps an authenticated IMAP connection for a single account.
@@ -232,19 +251,26 @@ func (c *Client) SyncFolder(db *sql.DB, folder string) error {
 		return c.finishFolder(db, logger, folder)
 	}
 
-	// Disable FTS5 auto-merge during bulk import — dramatically faster for large
-	// batches. We'll run a manual optimize() at the end instead.
-	// Use defer to guarantee re-enabling even if we return early on error.
-	if _, err := db.Exec(`INSERT INTO mail_content_fts(mail_content_fts, rank) VALUES('automerge', 0)`); err != nil {
-		logger.Warn("could not disable FTS automerge", "err", err)
-	} else {
-		defer func() {
-			// Re-enable automerge unless optimizeFTS already did so (it runs on success).
-			// The INSERT is idempotent — running it twice is harmless.
-			if _, err := db.Exec(`INSERT INTO mail_content_fts(mail_content_fts, rank) VALUES('automerge', 8)`); err != nil {
-				logger.Warn("could not re-enable FTS automerge (deferred)", "err", err)
-			}
-		}()
+	// FTS5 auto-merge is fine for incremental syncs.  Only large imports
+	// disable it, because merging after every inserted row dominates the
+	// import.  Turning it off unconditionally and then running a full
+	// `optimize` at the end of *every* sync (including a one-message poll)
+	// rewrote the whole index while the single SQLite connection was held,
+	// which made concurrent MCP queries wait for minutes.
+	bulk := len(pending) >= bulkImportThreshold
+	if bulk {
+		if _, err := db.Exec(`INSERT INTO mail_content_fts(mail_content_fts, rank) VALUES('automerge', 0)`); err != nil {
+			logger.Warn("could not disable FTS automerge", "err", err)
+		} else {
+			defer func() {
+				if _, err := db.Exec(`INSERT INTO mail_content_fts(mail_content_fts, rank) VALUES('automerge', 8)`); err != nil {
+					logger.Warn("could not re-enable FTS automerge (deferred)", "err", err)
+				}
+			}()
+		}
+	} else if _, err := db.Exec(`INSERT INTO mail_content_fts(mail_content_fts, rank) VALUES('automerge', 8)`); err != nil {
+		// Repair an auto-merge setting left at 0 by a killed bulk import.
+		logger.Warn("could not set FTS automerge", "err", err)
 	}
 
 	imported, skipped, err := c.importWindows(db, logger, folder, pending)
@@ -252,10 +278,15 @@ func (c *Client) SyncFolder(db *sql.DB, folder string) error {
 		return err
 	}
 
-	logger.Info("sync complete, optimizing FTS index...",
-		"new_messages", imported, "skipped", skipped)
+	logger.Info("sync complete",
+		"new_messages", imported, "skipped", skipped, "bulk", bulk)
 	persistUIDValidity(db, logger, c.cfg.ID, folder, uint32(selData.UIDValidity))
-	optimizeFTS(db, logger)
+	if bulk && imported > 0 {
+		// Bounded merge instead of a full optimize.  The page budget keeps the
+		// write short enough that tool queries are not starved; auto-merge
+		// (re-enabled above) compacts the remaining segments over time.
+		mergeFTS(db, logger, ftsMergePages)
+	}
 	return c.finishFolder(db, logger, folder)
 }
 
@@ -353,23 +384,26 @@ func metaFetchOptions() *imap.FetchOptions {
 // mail, say) contributes no section at all instead of downloading its payload.
 // Messages without sections are still indexed by subject and sender.
 func textSections(bs imap.BodyStructure) []*imap.FetchItemBodySection {
+	// Prefer text/plain when a message has both alternatives, but fall back to
+	// text/html for HTML-only mail.  Skipping HTML entirely left every
+	// newsletter and many corporate mails with an empty, unsearchable body.
+	var plain, richtext []*imap.FetchItemBodySection
+
 	switch root := bs.(type) {
 	case *imap.BodyStructureSinglePart:
-		if root.MediaType() != "text/plain" {
-			return nil
+		switch root.MediaType() {
+		case "text/plain":
+			plain = append(plain, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierText, Peek: true})
+		case "text/html":
+			richtext = append(richtext, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierText, Peek: true})
 		}
-		// A non-multipart message has no part numbers: its body is the text.
-		return []*imap.FetchItemBodySection{{Specifier: imap.PartSpecifierText, Peek: true}}
+		return plainOrHTML(plain, richtext)
 
 	case *imap.BodyStructureMultiPart:
-		var out []*imap.FetchItemBodySection
 		root.Walk(func(path []int, part imap.BodyStructure) bool {
 			single, ok := part.(*imap.BodyStructureSinglePart)
 			if !ok {
 				return true // multipart node: keep descending
-			}
-			if single.MediaType() != "text/plain" {
-				return true
 			}
 			if disp := single.Disposition(); disp != nil && strings.EqualFold(disp.Value, "attachment") {
 				return true
@@ -377,17 +411,27 @@ func textSections(bs imap.BodyStructure) []*imap.FetchItemBodySection {
 			if len(path) == 0 {
 				return true
 			}
-			out = append(out, &imap.FetchItemBodySection{
-				Part: append([]int(nil), path...),
-				Peek: true,
-			})
+			section := &imap.FetchItemBodySection{Part: append([]int(nil), path...), Peek: true}
+			switch single.MediaType() {
+			case "text/plain":
+				plain = append(plain, section)
+			case "text/html":
+				richtext = append(richtext, section)
+			}
 			return true
 		})
-		return out
+		return plainOrHTML(plain, richtext)
 
 	default:
 		return nil
 	}
+}
+
+func plainOrHTML(plain, richtext []*imap.FetchItemBodySection) []*imap.FetchItemBodySection {
+	if len(plain) > 0 {
+		return plain
+	}
+	return richtext
 }
 
 // sectionKey identifies a group of body sections so that every message needing
@@ -413,11 +457,23 @@ func sectionKey(sections []*imap.FetchItemBodySection) string {
 // until the offending UID is isolated. A non-nil error is only returned when the
 // connection cannot be re-established at all.
 func (c *Client) fetchResilient(folder string, uids []uint32, opts *imap.FetchOptions) (msgs []*imapclient.FetchMessageBuffer, bad []uint32, err error) {
+	return c.fetchResilientWith(folder, uids, opts, nil)
+}
+
+// fetchResilientWith is fetchResilient with an optional per-message handler.
+//
+// When onMessage is non-nil every decoded buffer is handed to it and then
+// dropped instead of being accumulated.  The body-text phase uses this so that
+// a 50-message window of multi-megabyte HTML newsletters is processed one
+// message at a time: the 256 KB body cap is applied before the next message is
+// read, instead of after the whole window is resident.  The caller that needs
+// the buffers (the metadata phase) passes nil and keeps the old behaviour.
+func (c *Client) fetchResilientWith(folder string, uids []uint32, opts *imap.FetchOptions, onMessage func(*imapclient.FetchMessageBuffer)) (msgs []*imapclient.FetchMessageBuffer, bad []uint32, err error) {
 	if len(uids) == 0 {
 		return nil, nil, nil
 	}
 
-	got, received, ferr := c.fetchWindow(folder, uids, opts)
+	got, received, ferr := c.fetchWindowWith(folder, uids, opts, onMessage)
 	msgs = append(msgs, got...)
 
 	// A UID counts as resolved only if its response actually arrived. A command
@@ -445,11 +501,11 @@ func (c *Client) fetchResilient(folder string, uids []uint32, opts *imap.FetchOp
 	}
 
 	mid := len(rest) / 2
-	leftMsgs, leftBad, lerr := c.fetchResilient(folder, rest[:mid], opts)
+	leftMsgs, leftBad, lerr := c.fetchResilientWith(folder, rest[:mid], opts, onMessage)
 	if lerr != nil {
 		return append(msgs, leftMsgs...), leftBad, lerr
 	}
-	rightMsgs, rightBad, rerr := c.fetchResilient(folder, rest[mid:], opts)
+	rightMsgs, rightBad, rerr := c.fetchResilientWith(folder, rest[mid:], opts, onMessage)
 	msgs = append(append(msgs, leftMsgs...), rightMsgs...)
 	bad = append(leftBad, rightBad...)
 	return msgs, bad, rerr
@@ -479,8 +535,9 @@ func (c *Client) fetchTextBodies(folder string, msgs []*imapclient.FetchMessageB
 		byUID[uid] = msg
 		secs := textSections(msg.BodyStructure)
 		if len(secs) == 0 {
-			// Nothing readable (attachment-only or HTML-only mail): index the
-			// metadata and leave the body empty rather than fetching a payload.
+			// Nothing readable (attachment-only mail, or a structure with no
+			// text part): index the metadata and leave the body empty rather
+			// than fetching a payload.
 			texts[uid] = ""
 			continue
 		}
@@ -495,23 +552,25 @@ func (c *Client) fetchTextBodies(folder string, msgs []*imapclient.FetchMessageB
 	var bad []uint32
 	for _, k := range order {
 		uids := grouped[k]
-		got, failed, err := c.fetchResilient(folder, uids, &imap.FetchOptions{
+		// Extract and truncate each message as it arrives.  fetchResilient
+		// would otherwise hold every body in the window at once, and a window
+		// of 50 multi-megabyte HTML newsletters would exceed the 128 MB
+		// container limit before the 256 KB cap is applied.
+		arrived := make(map[uint32]struct{}, len(uids))
+		_, failed, err := c.fetchResilientWith(folder, uids, &imap.FetchOptions{
 			UID:         true,
 			BodySection: sections[k],
-		})
-		if err != nil {
-			return nil, nil, err
-		}
-
-		arrived := make(map[uint32]struct{}, len(got))
-		for _, buf := range got {
+		}, func(buf *imapclient.FetchMessageBuffer) {
 			uid := uint32(buf.UID)
 			src := byUID[uid]
 			if src == nil {
-				continue
+				return
 			}
 			arrived[uid] = struct{}{}
-			texts[uid] = extractTextFromSections(src.BodyStructure, buf)
+			texts[uid] = truncateUTF8(extractTextFromSections(src.BodyStructure, buf), maxStoredBodyBytes)
+		})
+		if err != nil {
+			return nil, nil, err
 		}
 
 		bad = append(bad, failed...)
@@ -551,6 +610,10 @@ func withoutUIDs(msgs []*imapclient.FetchMessageBuffer, drop []uint32) []*imapcl
 // fetchWindow runs a single FETCH and reports which UIDs actually arrived.
 // A non-nil error means the response stream was not fully usable.
 func (c *Client) fetchWindow(folder string, uids []uint32, opts *imap.FetchOptions) ([]*imapclient.FetchMessageBuffer, map[uint32]struct{}, error) {
+	return c.fetchWindowWith(folder, uids, opts, nil)
+}
+
+func (c *Client) fetchWindowWith(folder string, uids []uint32, opts *imap.FetchOptions, onMessage func(*imapclient.FetchMessageBuffer)) ([]*imapclient.FetchMessageBuffer, map[uint32]struct{}, error) {
 	var (
 		lastMsgs     []*imapclient.FetchMessageBuffer
 		lastReceived map[uint32]struct{}
@@ -561,7 +624,7 @@ func (c *Client) fetchWindow(folder string, uids []uint32, opts *imap.FetchOptio
 		if err := c.ensureConnected(folder); err != nil {
 			return nil, nil, err
 		}
-		msgs, received, err := c.fetchOnce(uids, opts)
+		msgs, received, err := c.fetchOnce(uids, opts, onMessage)
 		lastMsgs, lastReceived = msgs, received
 		if err == nil {
 			return msgs, received, nil
@@ -582,7 +645,7 @@ func (c *Client) fetchWindow(folder string, uids []uint32, opts *imap.FetchOptio
 // sync forever: go-imap has no read deadline, so the guard below closes the
 // connection and lets fetchWindow retry (and, if needed, bisect) instead of
 // hanging on one silent server.
-func (c *Client) fetchOnce(uids []uint32, opts *imap.FetchOptions) ([]*imapclient.FetchMessageBuffer, map[uint32]struct{}, error) {
+func (c *Client) fetchOnce(uids []uint32, opts *imap.FetchOptions, onMessage func(*imapclient.FetchMessageBuffer)) ([]*imapclient.FetchMessageBuffer, map[uint32]struct{}, error) {
 	var uidSet imap.UIDSet
 	for _, uid := range uids {
 		uidSet.AddNum(imap.UID(uid))
@@ -619,6 +682,13 @@ func (c *Client) fetchOnce(uids []uint32, opts *imap.FetchOptions) ([]*imapclien
 			continue
 		}
 		received[uint32(buf.UID)] = struct{}{}
+		if onMessage != nil {
+			// Hand the body to the caller and let it go before the next
+			// message is read.  This is what keeps the 50-message window
+			// bounded by one message's payload rather than fifty.
+			onMessage(buf)
+			continue
+		}
 		msgs = append(msgs, buf)
 	}
 
@@ -795,7 +865,122 @@ func (c *Client) finishFolder(db *sql.DB, logger *slog.Logger, folder string) er
 	if err := c.backfillEnvelope(db, logger, folder); err != nil {
 		logger.Warn("envelope backfill failed", "err", err)
 	}
+	if err := c.backfillCJK(db, logger, folder); err != nil {
+		logger.Warn("CJK index backfill failed", "err", err)
+	}
 	return nil
+}
+
+// backfillCJK incrementally indexes messages that were imported before the
+// auxiliary CJK index existed.  It runs after every folder sync (including
+// "up to date" runs) and is resumable via mail_content.cjk_indexed.
+func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) error {
+	const (
+		// The query materialises body_text for each row.  Keep the batch small:
+		// 25 × the 256 KB body cap is ~6 MB, safe inside a 128 MB container.
+		batchSize  = 25
+		maxPerSync = 2000
+	)
+	total := 0
+	for total < maxPerSync {
+		rows, err := db.Query(`
+			SELECT e.id, e.subject, COALESCE(c.body_text, '')
+			FROM mail_entries e
+			LEFT JOIN mail_content c ON c.entry_id = e.id
+			WHERE e.account_id = ? AND e.imap_folder = ?
+			  AND (c.cjk_indexed IS NULL OR c.cjk_indexed = 0)
+			ORDER BY e.imap_uid
+			LIMIT ?`, c.cfg.ID, folder, batchSize)
+		if err != nil {
+			return fmt.Errorf("backfillCJK: query: %w", err)
+		}
+		type item struct {
+			id, subject, body string
+		}
+		var items []item
+		for rows.Next() {
+			var it item
+			if err := rows.Scan(&it.id, &it.subject, &it.body); err == nil {
+				items = append(items, it)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("backfillCJK: iterate: %w", err)
+		}
+		rows.Close()
+		if len(items) == 0 {
+			// Nothing left in this folder: searches may now use the auxiliary
+			// index.  Until this flag is set, queries use the bounded substring
+			// fallback so they cannot silently omit unindexed older mail.
+			markCJKBackfillDone(db, logger, c.cfg.ID, folder)
+			return nil
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("backfillCJK: begin tx: %w", err)
+		}
+		del, err := tx.Prepare(`DELETE FROM mail_cjk_fts WHERE entry_id = ?`)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("backfillCJK: prepare delete: %w", err)
+		}
+		ins, err := tx.Prepare(`INSERT INTO mail_cjk_fts (entry_id, text) VALUES (?, ?)`)
+		if err != nil {
+			del.Close()
+			tx.Rollback()
+			return fmt.Errorf("backfillCJK: prepare insert: %w", err)
+		}
+		mark, err := tx.Prepare(`INSERT INTO mail_content (entry_id, body_text, cjk_indexed)
+			VALUES (?, ?, 1)
+			ON CONFLICT(entry_id) DO UPDATE SET cjk_indexed = 1`)
+		if err != nil {
+			del.Close()
+			ins.Close()
+			tx.Rollback()
+			return fmt.Errorf("backfillCJK: prepare mark: %w", err)
+		}
+		for _, it := range items {
+			if _, err := del.Exec(it.id); err != nil {
+				logger.Warn("backfillCJK: delete old row", "entry_id", it.id, "err", err)
+				continue
+			}
+			text := it.subject + "\n" + it.body
+			if maildb.HasCJK(text) {
+				if _, err := ins.Exec(it.id, maildb.CJKIndexText(text)); err != nil {
+					logger.Warn("backfillCJK: insert", "entry_id", it.id, "err", err)
+					continue
+				}
+			}
+			if _, err := mark.Exec(it.id, it.body); err != nil {
+				logger.Warn("backfillCJK: mark indexed", "entry_id", it.id, "err", err)
+			}
+		}
+		del.Close()
+		ins.Close()
+		mark.Close()
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("backfillCJK: commit: %w", err)
+		}
+		total += len(items)
+	}
+	if total > 0 {
+		logger.Info("CJK index backfill progress", "processed", total)
+	}
+	return nil
+}
+
+// markCJKBackfillDone records that this folder no longer has messages missing
+// from the auxiliary CJK index.  Search uses this flag to decide between the
+// fast CJK index and the complete-but-slower bounded substring fallback.
+func markCJKBackfillDone(db *sql.DB, logger *slog.Logger, accountID, folder string) {
+	if _, err := db.Exec(
+		`UPDATE sync_state SET cjk_backfill_done = 1
+		 WHERE account_id = ? AND imap_folder = ?`, accountID, folder,
+	); err != nil {
+		logger.Warn("backfillCJK: could not mark backfill complete", "err", err)
+	}
 }
 
 // quarantine records a message that cannot be fetched in any form. The UID is
@@ -885,7 +1070,16 @@ func (c *Client) ingestRaw(db *sql.DB, logger *slog.Logger, folder string, uid u
 	var uidSet imap.UIDSet
 	uidSet.AddNum(imap.UID(uid))
 
-	fetchCmd := c.client.Fetch(uidSet, &imap.FetchOptions{
+	// The raw fallback must be bounded too: a server that accepts the command
+	// and then goes silent would otherwise hang the whole folder sync forever.
+	client := c.client
+	guard := newStallGuard(fetchStallTimeout, func() {
+		slog.Warn("raw fetch stalled, dropping the connection", "uid", uid, "timeout", fetchStallTimeout)
+		client.Close() //nolint:errcheck // the connection is considered lost
+	})
+	defer guard.stop()
+
+	fetchCmd := client.Fetch(uidSet, &imap.FetchOptions{
 		UID:          true,
 		Flags:        true,
 		InternalDate: true,
@@ -899,10 +1093,12 @@ func (c *Client) ingestRaw(db *sql.DB, logger *slog.Logger, folder string, uid u
 		if msg == nil {
 			break
 		}
+		guard.touch()
 		b, err := msg.Collect()
 		if err != nil {
 			break
 		}
+		guard.touch()
 		buf = b
 	}
 	if err := fetchCmd.Close(); err != nil {
@@ -983,6 +1179,21 @@ func checkAndResetUIDValidity(db *sql.DB, logger *slog.Logger, accountID, folder
 	}
 	logger.Warn("UIDValidity changed — purging stale data and re-syncing",
 		"stored", storedValidity, "server", selData.UIDValidity)
+	// mail_content_fts and mail_content have no foreign key to mail_entries.
+	// Delete them explicitly, otherwise the re-sync inserts a second FTS row
+	// for every UID while INSERT OR IGNORE keeps the old body text.
+	for _, stmt := range []string{
+		`DELETE FROM mail_content_fts WHERE entry_id IN
+			(SELECT id FROM mail_entries WHERE account_id = ? AND imap_folder = ?)`,
+		`DELETE FROM mail_cjk_fts WHERE entry_id IN
+			(SELECT id FROM mail_entries WHERE account_id = ? AND imap_folder = ?)`,
+		`DELETE FROM mail_content WHERE entry_id IN
+			(SELECT id FROM mail_entries WHERE account_id = ? AND imap_folder = ?)`,
+	} {
+		if _, err := db.Exec(stmt, accountID, folder); err != nil {
+			return 0, fmt.Errorf("sync: purge stale index rows: %w", err)
+		}
+	}
 	if _, err := db.Exec(
 		`DELETE FROM mail_entries WHERE account_id = ? AND imap_folder = ?`,
 		accountID, folder,
@@ -1065,6 +1276,7 @@ func (c *Client) importMessageBatch(db *sql.DB, logger *slog.Logger, folder stri
 
 // storeEntry writes one locally parsed message (raw-literal fallback path).
 func (c *Client) storeEntry(db *sql.DB, entry mailEntry, body string, attachments []attachmentInfo) error {
+	body = truncateUTF8(body, maxStoredBodyBytes)
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("sync: begin transaction: %w", err)
@@ -1091,6 +1303,10 @@ func (c *Client) storeEntry(db *sql.DB, entry mailEntry, body string, attachment
 			tx.Rollback()
 			return fmt.Errorf("sync: fts insert uid=%d: %w", entry.IMAPUID, err)
 		}
+		if err := insertCJKIndex(stmts.cjkIns, entry.ID, entry.Subject, body); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("sync: cjk insert uid=%d: %w", entry.IMAPUID, err)
+		}
 		if _, err := stmts.contentIns.Exec(entry.ID, body); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("sync: content insert uid=%d: %w", entry.IMAPUID, err)
@@ -1113,6 +1329,7 @@ func (c *Client) storeEntry(db *sql.DB, entry mailEntry, body string, attachment
 type batchStmts struct {
 	entry      *sql.Stmt
 	ftsIns     *sql.Stmt
+	cjkIns     *sql.Stmt
 	contentIns *sql.Stmt
 	att        *sql.Stmt
 }
@@ -1132,7 +1349,11 @@ func prepareBatchStmts(tx *sql.Tx) (*batchStmts, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sync: prepare fts ins stmt: %w", err)
 	}
-	contentIns, err := tx.Prepare(`INSERT OR IGNORE INTO mail_content (entry_id, body_text) VALUES (?, ?)`)
+	cjkIns, err := tx.Prepare(`INSERT INTO mail_cjk_fts (entry_id, text) VALUES (?, ?)`)
+	if err != nil {
+		return nil, fmt.Errorf("sync: prepare cjk ins stmt: %w", err)
+	}
+	contentIns, err := tx.Prepare(`INSERT OR IGNORE INTO mail_content (entry_id, body_text, cjk_indexed) VALUES (?, ?, 1)`)
 	if err != nil {
 		return nil, fmt.Errorf("sync: prepare content ins stmt: %w", err)
 	}
@@ -1140,13 +1361,17 @@ func prepareBatchStmts(tx *sql.Tx) (*batchStmts, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sync: prepare att stmt: %w", err)
 	}
-	return &batchStmts{entry: entry, ftsIns: ftsIns, contentIns: contentIns, att: att}, nil
+	return &batchStmts{entry: entry, ftsIns: ftsIns, cjkIns: cjkIns, contentIns: contentIns, att: att}, nil
 }
 
 // indexNewMessage inserts FTS, content, and attachment rows for a newly imported message.
 func indexNewMessage(tx *sql.Tx, stmts *batchStmts, entry mailEntry, msg *imapclient.FetchMessageBuffer, body string, uid uint32) error {
+	body = truncateUTF8(body, maxStoredBodyBytes)
 	if _, err := stmts.ftsIns.Exec(entry.ID, entry.Subject, body); err != nil {
 		return fmt.Errorf("sync: fts insert uid=%d: %w", uid, err)
+	}
+	if err := insertCJKIndex(stmts.cjkIns, entry.ID, entry.Subject, body); err != nil {
+		return fmt.Errorf("sync: cjk insert uid=%d: %w", uid, err)
 	}
 	if _, err := stmts.contentIns.Exec(entry.ID, body); err != nil {
 		return fmt.Errorf("sync: content insert uid=%d: %w", uid, err)
@@ -1157,6 +1382,17 @@ func indexNewMessage(tx *sql.Tx, stmts *batchStmts, entry mailEntry, msg *imapcl
 		}
 	}
 	return nil
+}
+
+// insertCJKIndex adds a row to the auxiliary CJK index when the text contains
+// CJK.  English-only messages are not duplicated in this index.
+func insertCJKIndex(stmt *sql.Stmt, entryID, subject, body string) error {
+	text := truncateUTF8(subject+"\n"+body, maxStoredBodyBytes)
+	if !maildb.HasCJK(text) {
+		return nil
+	}
+	_, err := stmt.Exec(entryID, maildb.CJKIndexText(text))
+	return err
 }
 
 // persistUIDValidity saves the server UIDValidity value to sync_state.
@@ -1173,10 +1409,16 @@ func persistUIDValidity(db *sql.DB, logger *slog.Logger, accountID, folder strin
 	}
 }
 
-// optimizeFTS runs FTS5 optimize and re-enables auto-merge.
-func optimizeFTS(db *sql.DB, logger *slog.Logger) {
-	if _, err := db.Exec(`INSERT INTO mail_content_fts(mail_content_fts) VALUES('optimize')`); err != nil {
-		logger.Warn("FTS optimize failed", "err", err)
+// mergeFTS merges at most pages pages of the FTS5 index and re-enables
+// auto-merge.  It is deliberately bounded: a full `optimize` rewrites every
+// segment and can hold the database connection long enough to make MCP tool
+// calls time out on large mailboxes.
+func mergeFTS(db *sql.DB, logger *slog.Logger, pages int) {
+	if pages <= 0 {
+		pages = ftsMergePages
+	}
+	if _, err := db.Exec(`INSERT INTO mail_content_fts(mail_content_fts, rank) VALUES('merge', ?)`, pages); err != nil {
+		logger.Warn("FTS merge failed", "err", err)
 	}
 	if _, err := db.Exec(`INSERT INTO mail_content_fts(mail_content_fts, rank) VALUES('automerge', 8)`); err != nil {
 		logger.Warn("could not re-enable FTS automerge", "err", err)
@@ -1227,7 +1469,12 @@ func (c *Client) backfillFlags(db *sql.DB, logger *slog.Logger, folder string) e
 			uidSet.AddNum(imap.UID(uid))
 		}
 
-		fetchCmd := c.client.Fetch(uidSet, &imap.FetchOptions{UID: true, Flags: true})
+		client := c.client
+		guard := newStallGuard(fetchStallTimeout, func() {
+			slog.Warn("backfillFlags fetch stalled, dropping the connection", "timeout", fetchStallTimeout)
+			client.Close() //nolint:errcheck // the connection is considered lost
+		})
+		fetchCmd := client.Fetch(uidSet, &imap.FetchOptions{UID: true, Flags: true})
 		type flagResult struct {
 			uid       uint32
 			isRead    int
@@ -1239,11 +1486,13 @@ func (c *Client) backfillFlags(db *sql.DB, logger *slog.Logger, folder string) e
 			if msg == nil {
 				break
 			}
+			guard.touch()
 			buf, err := msg.Collect()
 			if err != nil {
 				logger.Warn("backfillFlags: collect error", "err", err)
 				continue
 			}
+			guard.touch()
 			isRead, isReplied := 0, 0
 			for _, f := range buf.Flags {
 				switch f {
@@ -1255,10 +1504,12 @@ func (c *Client) backfillFlags(db *sql.DB, logger *slog.Logger, folder string) e
 			}
 			results = append(results, flagResult{uint32(buf.UID), isRead, isReplied})
 		}
-		if err := fetchCmd.Close(); err != nil {
+		closeErr := fetchCmd.Close()
+		guard.stop()
+		if closeErr != nil {
 			// Leave the rows NULL instead of writing guessed flags: the batch is
 			// retried on the next sync, and the next folder still gets its turn.
-			logger.Warn("backfillFlags: fetch failed, leaving batch untouched", "err", err)
+			logger.Warn("backfillFlags: fetch failed, leaving batch untouched", "err", closeErr)
 			if cerr := c.ensureConnected(folder); cerr != nil {
 				return fmt.Errorf("backfillFlags: reconnect: %w", cerr)
 			}
@@ -1580,6 +1831,9 @@ func extractTextFromSections(bs imap.BodyStructure, msg *imapclient.FetchMessage
 	var parts []string
 	for _, section := range msg.BodySection {
 		text := strings.TrimSpace(decodeBody(section.Bytes, encodingForSection(bs, section.Section)))
+		if strings.EqualFold(mediaTypeForSection(bs, section.Section), "text/html") {
+			text = strings.TrimSpace(htmlToText(text))
+		}
 		if text != "" {
 			parts = append(parts, text)
 		}
@@ -1615,6 +1869,64 @@ func encodingForSection(bs imap.BodyStructure, section *imap.FetchItemBodySectio
 		return false
 	})
 	return enc
+}
+
+// mediaTypeForSection returns the MIME type of the part a body section belongs
+// to, using the same path lookup as encodingForSection.
+func mediaTypeForSection(bs imap.BodyStructure, section *imap.FetchItemBodySection) string {
+	if bs == nil || section == nil {
+		return ""
+	}
+	if section.Specifier == imap.PartSpecifierText {
+		if sp, ok := bs.(*imap.BodyStructureSinglePart); ok {
+			return sp.MediaType()
+		}
+		return ""
+	}
+	if len(section.Part) == 0 {
+		return ""
+	}
+	var mediaType string
+	bs.Walk(func(path []int, part imap.BodyStructure) bool {
+		if !slices.Equal(path, section.Part) {
+			return true
+		}
+		if sp, ok := part.(*imap.BodyStructureSinglePart); ok {
+			mediaType = sp.MediaType()
+		}
+		return false
+	})
+	return mediaType
+}
+
+var (
+	htmlBlockRE = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>`)
+	htmlTagRE   = regexp.MustCompile(`(?s)<[^>]*>`)
+)
+
+// htmlToText produces a searchable plain-text approximation of an HTML body.
+// It is deliberately simple: tags and scripts are removed, entities decoded,
+// and whitespace collapsed.  It is not a renderer.
+func htmlToText(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = htmlBlockRE.ReplaceAllString(s, " ")
+	s = htmlTagRE.ReplaceAllString(s, " ")
+	s = html.UnescapeString(s)
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// truncateUTF8 shortens s to at most max bytes without splitting a rune.
+func truncateUTF8(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	s = s[:max]
+	for len(s) > 0 && !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s
 }
 
 // decodeBody decodes a message body from its transfer encoding (quoted-printable or base64).

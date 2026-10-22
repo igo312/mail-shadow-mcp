@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -53,6 +54,53 @@ func folderMutex(accountID, folder string) *sync.Mutex {
 		folderLocks[key] = &sync.Mutex{}
 	}
 	return folderLocks[key]
+}
+
+// Jitter returns a random delay up to half the sync interval, capped at the
+// configured maximum (five minutes when that is zero).  With 100 containers a
+// host restart would otherwise start every initial sync and every IDLE initial
+// sync at the same moment, producing a memory spike across the whole host.
+// Spreading the starts keeps the peak close to the per-container steady state.
+func Jitter(interval, maxJitter time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	if maxJitter <= 0 {
+		maxJitter = 5 * time.Minute
+	}
+	max := interval / 2
+	if maxJitter < max {
+		max = maxJitter
+	}
+	if max <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(max)))
+}
+
+// InitialDelay is the delay before the first sync after the process starts.
+//
+// Jitter exists to avoid 100 containers hitting their IMAP servers together
+// after a host restart, but applying it to a brand-new instance means a user
+// who just added a mailbox sees no mail (and no searchable data) for up to half
+// the sync interval.  Only an instance that already has synced data is a
+// restart; a fresh database syncs immediately.
+func InitialDelay(db *sql.DB, cfg *config.Config, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	var synced int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sync_state WHERE last_uid > 0`,
+	).Scan(&synced); err != nil {
+		// The table always exists after migration; if it does not, prefer the
+		// immediate first sync over an unexplained delay.
+		return 0
+	}
+	if synced == 0 {
+		return 0
+	}
+	return Jitter(interval, time.Duration(cfg.SyncJitterSec)*time.Second)
 }
 
 // RunAll syncs every account in the config concurrently.
@@ -275,8 +323,11 @@ func runIdleSession(accCfg config.AccountConfig, folder string, cfg *config.Conf
 		return fmt.Errorf("select %q: %w", folder, err)
 	}
 
-	// Initial sync on connect.
+	// Initial sync on connect.  A fresh instance syncs now; a restart with
+	// existing data is spread across containers so 100 imports do not start at
+	// once.
 	logger.Info("IDLE: initial sync")
+	time.Sleep(InitialDelay(db, cfg, time.Duration(cfg.SyncIntervalMin)*time.Minute))
 	if err := syncOneFolder(accCfg, folder, db); err != nil {
 		logger.Error("IDLE: initial sync failed", "err", err)
 	}

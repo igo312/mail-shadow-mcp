@@ -103,6 +103,43 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(row["action"], "test")
         self.assertIn('"x": 1', row["detail"])
 
+    def test_reserve_instance_enforces_capacity_atomically(self) -> None:
+        self.db.insert_instance(instance_record())
+        second = instance_record(id="def456", email="two@example.com", token_hash="token2")
+        self.assertEqual(self.db.reserve_instance(second, max_instances=1), "capacity")
+        self.assertEqual(self.db.count_active_instances(), 1)
+
+    def test_reserve_instance_zero_means_unlimited(self) -> None:
+        for index in range(5):
+            record = instance_record(
+                id=f"unlimited{index}",
+                email=f"unlimited{index}@example.com",
+                token_hash=f"unlimited-token-{index}",
+            )
+            self.assertEqual(self.db.reserve_instance(record, max_instances=0), "ok")
+        self.assertEqual(self.db.count_active_instances(), 5)
+
+    def test_reserve_instance_race_does_not_overshoot(self) -> None:
+        import threading
+
+        successes: list[bool] = []
+
+        def worker(index: int) -> None:
+            record = instance_record(
+                id=f"race{index:04d}",
+                email=f"race{index}@example.com",
+                token_hash=f"token-{index}",
+            )
+            successes.append(self.db.reserve_instance(record, max_instances=3) == "ok")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(1 for ok in successes if ok), 3)
+        self.assertEqual(self.db.count_active_instances(), 3)
+
     def test_unique_email_and_token(self) -> None:
         self.db.insert_instance(instance_record())
         with self.assertRaises(Exception):

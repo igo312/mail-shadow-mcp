@@ -20,48 +20,95 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	_ "modernc.org/sqlite"
 )
 
 // Open opens (or creates) the SQLite database at the given path.
-// It enables WAL mode and foreign key enforcement.
+//
+// File-backed databases use several connections so a long sync write no longer
+// blocks MCP reads behind the single connection the old implementation used.
+// WAL allows concurrent readers with one writer. Per-connection PRAGMAs are set
+// through the DSN because database/sql may open each connection lazily.
+//
+// In-memory databases stay on a single connection: a second connection to
+// ":memory:" would be a *different* database.
 func Open(path string) (*sql.DB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("db: cannot create directory for %q: %w", path, err)
+	if path != ":memory:" && !strings.HasPrefix(path, "file:") {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, fmt.Errorf("db: cannot create directory for %q: %w", path, err)
+		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	dsn := path
+	if path != ":memory:" && !strings.HasPrefix(path, "file:") {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("db: resolve path %q: %w", path, err)
+		}
+		abs = filepath.ToSlash(abs)
+		if runtime.GOOS == "windows" && len(abs) >= 2 && abs[1] == ':' {
+			abs = "/" + abs
+		}
+		params := url.Values{}
+		// NORMAL: fsync only at checkpoints, not every commit — safe on app crash,
+		// only risks data loss on OS crash/power failure (acceptable for a cache DB).
+		for _, pragma := range []string{
+			"busy_timeout(10000)",
+			"foreign_keys(1)",
+			"synchronous(NORMAL)",
+			"cache_size(-4096)",
+			"temp_store(FILE)",
+			"mmap_size(0)",
+		} {
+			params.Add("_pragma", pragma)
+		}
+		dsn = (&url.URL{Scheme: "file", Path: abs, RawQuery: params.Encode()}).String()
+	}
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("db: cannot open %q: %w", path, err)
 	}
 
-	// SQLite performs best with a single connection for writes.
-	// PRAGMAs are per-connection, so this also ensures they always apply.
-	db.SetMaxOpenConns(1)
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+		// A shared-cache/file URI may be intentional, but the previous code
+		// assumed one connection; keep that guarantee for in-memory/test DBs.
+		db.SetMaxOpenConns(1)
+	} else {
+		// One writer + several readers. WAL gives readers a consistent snapshot
+		// while the sync engine is writing.
+		db.SetMaxOpenConns(2)
+		db.SetMaxIdleConns(2)
+	}
 
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("db: cannot connect to %q: %w", path, err)
 	}
 
-	// Apply pragmas explicitly — more reliable than DSN params across drivers.
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA foreign_keys=ON",
-		// NORMAL: fsync only at checkpoints, not every commit — safe on app crash,
-		// only risks data loss on OS crash/power failure (acceptable for a cache DB).
-		"PRAGMA synchronous=NORMAL",
-		// 64 MB page cache — reduces disk I/O during bulk inserts.
-		"PRAGMA cache_size=-65536",
-		// Store temp tables/indexes in memory instead of on disk.
-		"PRAGMA temp_store=MEMORY",
+	// journal_mode is persistent in the database file, so setting it once is
+	// enough. The other PRAGMAs are per-connection and already in the DSN.
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return nil, fmt.Errorf("db: cannot enable WAL: %w", err)
 	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			return nil, fmt.Errorf("db: cannot set pragma %q: %w", p, err)
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+		// The DSN path above is not used for these forms; apply the rest
+		// explicitly for the single connection.
+		for _, pragma := range []string{
+			"PRAGMA foreign_keys=ON",
+			"PRAGMA synchronous=NORMAL",
+			"PRAGMA cache_size=-4096",
+			"PRAGMA temp_store=MEMORY",
+			"PRAGMA mmap_size=0",
+		} {
+			if _, err := db.Exec(pragma); err != nil {
+				return nil, fmt.Errorf("db: cannot set pragma %q: %w", pragma, err)
+			}
 		}
 	}
 
@@ -96,9 +143,10 @@ func Migrate(db *sql.DB) error {
 
 		// Sync state: tracks highest UID synced per account+folder
 		`CREATE TABLE IF NOT EXISTS sync_state (
-			account_id  TEXT NOT NULL,
-			imap_folder TEXT NOT NULL,
-			last_uid    INTEGER NOT NULL DEFAULT 0,
+			account_id         TEXT NOT NULL,
+			imap_folder        TEXT NOT NULL,
+			last_uid           INTEGER NOT NULL DEFAULT 0,
+			cjk_backfill_done  INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (account_id, imap_folder)
 		)`,
 
@@ -120,11 +168,18 @@ func Migrate(db *sql.DB) error {
 		`CREATE VIRTUAL TABLE IF NOT EXISTS mail_content_fts
 			USING fts5(entry_id UNINDEXED, subject, body_text)`,
 
+		// Auxiliary index for CJK substring search.  CJK text is written with
+		// spaces between characters, so unicode61 tokenizes each character and
+		// a 2-character Chinese term can match adjacent tokens.
+		`CREATE VIRTUAL TABLE IF NOT EXISTS mail_cjk_fts
+			USING fts5(entry_id UNINDEXED, text)`,
+
 		// Separate table for fast body_text retrieval (PRIMARY KEY = O(log n) lookup).
 		// FTS5 virtual tables only support full-text index scans, not column index lookups.
 		`CREATE TABLE IF NOT EXISTS mail_content (
-			entry_id  TEXT PRIMARY KEY,
-			body_text TEXT NOT NULL DEFAULT ''
+			entry_id     TEXT PRIMARY KEY,
+			body_text    TEXT NOT NULL DEFAULT '',
+			cjk_indexed  INTEGER NOT NULL DEFAULT 0
 		)`,
 
 		// Indexes
@@ -151,12 +206,18 @@ func Migrate(db *sql.DB) error {
 	// Each applied migration is logged so operators can see what ran on startup.
 	columnMigrations := []string{
 		`ALTER TABLE sync_state ADD COLUMN uid_validity INTEGER NOT NULL DEFAULT 0`,
+		// 0 = the auxiliary CJK index may still be missing rows for this folder,
+		// so CJK searches must use the bounded substring fallback until the
+		// backfill marks it done.  Existing rows default to 0, which is the safe
+		// (complete but slower) choice after an upgrade.
+		`ALTER TABLE sync_state ADD COLUMN cjk_backfill_done INTEGER NOT NULL DEFAULT 0`,
 		// Nullable: NULL means "flags not yet fetched" (pre-migration rows or backfill pending).
 		`ALTER TABLE mail_entries ADD COLUMN is_read    INTEGER`,
 		`ALTER TABLE mail_entries ADD COLUMN is_replied INTEGER`,
 		// Nullable: NULL means "envelope not yet backfilled" (pre-R6 rows).
 		`ALTER TABLE mail_entries ADD COLUMN message_id  TEXT`,
 		`ALTER TABLE mail_entries ADD COLUMN in_reply_to TEXT`,
+		`ALTER TABLE mail_content ADD COLUMN cjk_indexed INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range columnMigrations {
 		if _, err := db.Exec(stmt); err != nil {

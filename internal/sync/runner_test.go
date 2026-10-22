@@ -10,8 +10,10 @@ package imapsync
 
 import (
 	"testing"
+	"time"
 
 	"github.com/dryas/mail-shadow-mcp/internal/config"
+	maildb "github.com/dryas/mail-shadow-mcp/internal/db"
 )
 
 // fakeClient is a stub that satisfies the folder-listing contract used by resolveFolders.
@@ -73,5 +75,47 @@ func TestAccountResult_Fields(t *testing.T) {
 	}
 	if r.Err != nil {
 		t.Errorf("Err should be nil")
+	}
+}
+
+func TestJitterBounds(t *testing.T) {
+	if got := Jitter(0, 0); got != 0 {
+		t.Errorf("Jitter(0, 0) = %v, want 0", got)
+	}
+	for i := 0; i < 20; i++ {
+		got := Jitter(10*time.Minute, 5*time.Minute)
+		if got < 0 || got > 5*time.Minute {
+			t.Fatalf("Jitter(10m) = %v, want [0,5m]", got)
+		}
+	}
+}
+
+func TestInitialDelayFreshDatabaseIsImmediate(t *testing.T) {
+	database, err := maildb.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { database.Close() }) //nolint:errcheck // test cleanup
+	if err := maildb.Migrate(database); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	cfg := &config.Config{SyncJitterSec: 1800}
+	if got := InitialDelay(database, cfg, 30*time.Minute); got != 0 {
+		t.Fatalf("fresh instance should sync immediately, got %v", got)
+	}
+
+	if _, err := database.Exec(
+		`INSERT INTO sync_state (account_id, imap_folder, last_uid)
+		 VALUES ('acct', 'INBOX', 42)`,
+	); err != nil {
+		t.Fatalf("seed sync_state: %v", err)
+	}
+	// A restart with data is delayed, but never beyond half the interval or the
+	// configured cap.
+	for i := 0; i < 20; i++ {
+		got := InitialDelay(database, cfg, 30*time.Minute)
+		if got < 0 || got > 15*time.Minute {
+			t.Fatalf("restart delay = %v, want [0,15m]", got)
+		}
 	}
 }

@@ -9,11 +9,16 @@ helper container on stdin rather than appearing in the process list.
 
 from __future__ import annotations
 
+import hashlib
+import http.client
 import json
 import logging
+import os
+import socket
 import subprocess
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +28,23 @@ class DockerError(RuntimeError):
         super().__init__(f"{operation}: {message}")
         self.operation = operation
         self.message = message
+
+
+_API_UNAVAILABLE = object()
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """Minimal HTTP connection over a Unix domain socket (Docker API)."""
+
+    def __init__(self, socket_path: str, timeout: float = 5.0) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self.socket_path)
+        self.sock = sock
 
 
 @dataclass(frozen=True)
@@ -38,11 +60,54 @@ class ContainerSpec:
     pids: int
     container_port: int = 8080
     publish_loopback: bool = False
+    gomemlimit: str = "48MiB"
+    gogc: str = "50"
+    gomaxprocs: str = "1"
+
+
+def container_spec_hash(spec: ContainerSpec) -> str:
+    """Stable fingerprint of everything that requires container recreation.
+
+    Image, limits and runtime env are fixed at `docker run` time.  The label is
+    used by the reconcile command to notice portal default changes even when the
+    image ID and config file are unchanged.
+    """
+    payload = {
+        "image": spec.image,
+        "network": spec.network,
+        "config_volume": spec.config_volume,
+        "data_volume": spec.data_volume,
+        "memory": spec.memory,
+        "cpus": spec.cpus,
+        "pids": spec.pids,
+        "container_port": spec.container_port,
+        "publish_loopback": spec.publish_loopback,
+        "gomemlimit": spec.gomemlimit,
+        "gogc": spec.gogc,
+        "gomaxprocs": spec.gomaxprocs,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 class DockerClient:
-    def __init__(self, binary: str = "docker") -> None:
+    def __init__(self, binary: str = "docker", socket_path: str | None = None) -> None:
         self.binary = binary
+        if socket_path is None:
+            explicit = os.environ.get("MSM_DOCKER_SOCKET", "").strip()
+            docker_host = os.environ.get("DOCKER_HOST", "").strip()
+            docker_context = os.environ.get("DOCKER_CONTEXT", "").strip()
+            if explicit:
+                socket_path = explicit
+            elif docker_host.startswith("unix://"):
+                socket_path = docker_host[len("unix://") :]
+            elif docker_host or docker_context:
+                # Remote daemon or a named context: the Unix socket would not
+                # describe the same daemon as the docker CLI.
+                socket_path = ""
+            else:
+                socket_path = "/var/run/docker.sock"
+        self.socket_path = socket_path or ""
 
     # -- low level -------------------------------------------------------
     def _run(
@@ -125,6 +190,22 @@ class DockerClient:
         if not self.image_exists(image):
             self.pull_image(image)
 
+    def image_id(self, image: str) -> str:
+        """Return the immutable image ID for a tag (e.g. sha256:...)."""
+        result = self._run(
+            "inspect image",
+            ["image", "inspect", "--format", "{{.Id}}", image],
+            timeout=20,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-600:]
+            raise DockerError("inspect image", detail or f"image {image!r} not found")
+        image_id = result.stdout.strip()
+        if not image_id:
+            raise DockerError("inspect image", f"image {image!r} has no ID")
+        return image_id
+
     # -- config volume ---------------------------------------------------
     def write_config_volume(self, volume: str, image: str, content: str) -> None:
         """Write config.yaml into a named volume without a host bind mount.
@@ -152,6 +233,33 @@ class DockerClient:
             timeout=900,
             input_data=content,
         )
+
+    def read_config_volume(self, volume: str, image: str) -> str:
+        """Read config.yaml back from a named volume.
+
+        Used by the no-user-action migration path: the config volume is the only
+        place that still has the mailbox password and the instance's bearer
+        token.  The helper container is not attached to any network and the
+        volume is mounted read-only.  The content is never logged.
+        """
+        result = self._run(
+            "read config volume",
+            [
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--entrypoint",
+                "/bin/sh",
+                "-v",
+                f"{volume}:/config:ro",
+                image,
+                "-c",
+                "cat /config/config.yaml",
+            ],
+            timeout=120,
+        )
+        return result.stdout
 
     # -- containers ------------------------------------------------------
     def remove_container(self, name: str) -> None:
@@ -185,6 +293,18 @@ class DockerClient:
                 "msm.managed=true",
                 "--label",
                 f"msm.instance={spec.instance_id}",
+                "--label",
+                f"msm.spec={container_spec_hash(spec)}",
+                "--env",
+                f"GOMEMLIMIT={spec.gomemlimit}",
+                "--env",
+                f"GOGC={spec.gogc}",
+                "--env",
+                f"GOMAXPROCS={spec.gomaxprocs}",
+                "--env",
+                "TMPDIR=/data/tmp",
+                "--env",
+                "SQLITE_TMPDIR=/data/tmp",
                 "--memory",
                 spec.memory,
                 "--memory-swap",
@@ -199,7 +319,7 @@ class DockerClient:
                 "no-new-privileges:true",
                 "--read-only",
                 "--tmpfs",
-                "/tmp:rw,noexec,nosuid,size=64m",
+                "/tmp:rw,noexec,nosuid,size=8m",
                 "--log-driver",
                 "json-file",
                 "--log-opt",
@@ -233,6 +353,41 @@ class DockerClient:
         self._run("start container", ["start", name], timeout=60)
 
     def inspect_container(self, name: str) -> dict[str, Any] | None:
+        """Return a container's inspect object.
+
+        The gateway calls this for every MCP request.  Spawning `docker inspect`
+        is correct but costs ~20 ms per call; at 100 instances that becomes the
+        control-plane bottleneck.  Docker's HTTP API over the Unix socket is a
+        few hundred microseconds, so use it when available and fall back to the
+        CLI for remote daemons, Windows contexts, or older/restricted sockets.
+        """
+        fast = self._inspect_api(name)
+        if fast is not _API_UNAVAILABLE:
+            return fast
+        return self._inspect_cli(name)
+
+    def _inspect_api(self, name: str) -> dict[str, Any] | None | object:
+        if not self.socket_path or not os.path.exists(self.socket_path):
+            return _API_UNAVAILABLE
+        connection = _UnixHTTPConnection(self.socket_path, timeout=5.0)
+        try:
+            connection.request("GET", f"/containers/{quote(name, safe='')}/json")
+            response = connection.getresponse()
+            payload = response.read()
+            if response.status == 404:
+                return None
+            if response.status != 200:
+                log.debug("docker API inspect %s returned HTTP %s", name, response.status)
+                return _API_UNAVAILABLE
+            parsed = json.loads(payload)
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            log.debug("docker API inspect failed for %s: %s", name, exc)
+            return _API_UNAVAILABLE
+        finally:
+            connection.close()
+        return parsed if isinstance(parsed, dict) else None
+
+    def _inspect_cli(self, name: str) -> dict[str, Any] | None:
         result = self._run(
             "inspect container",
             ["inspect", "--type", "container", name],
@@ -261,29 +416,13 @@ class DockerClient:
         info = self.inspect_container(name)
         if not info:
             return None
-        networks = (info.get("NetworkSettings") or {}).get("Networks") or {}
-        entry = networks.get(network)
-        if isinstance(entry, dict) and entry.get("IPAddress"):
-            return str(entry["IPAddress"])
-        for value in networks.values():
-            if isinstance(value, dict) and value.get("IPAddress"):
-                return str(value["IPAddress"])
-        return None
+        return container_ip_from_info(info, network)
 
     def container_host_port(self, name: str, container_port: int) -> int | None:
         info = self.inspect_container(name)
         if not info:
             return None
-        ports = (info.get("NetworkSettings") or {}).get("Ports") or {}
-        bindings = ports.get(f"{int(container_port)}/tcp")
-        if isinstance(bindings, list):
-            for binding in bindings:
-                if isinstance(binding, dict) and binding.get("HostPort"):
-                    try:
-                        return int(binding["HostPort"])
-                    except (TypeError, ValueError):
-                        return None
-        return None
+        return host_port_from_info(info, container_port)
 
     def logs(self, name: str, *, tail: int = 60) -> str:
         result = self._run(
@@ -321,3 +460,47 @@ class DockerClient:
             except json.JSONDecodeError:
                 continue
         return containers
+
+
+def container_ip_from_info(info: dict[str, Any], network: str) -> str | None:
+    """Return the container's IP on ``network`` (or any network) from inspect."""
+    networks = (info.get("NetworkSettings") or {}).get("Networks") or {}
+    entry = networks.get(network)
+    if isinstance(entry, dict) and entry.get("IPAddress"):
+        return str(entry["IPAddress"])
+    for value in networks.values():
+        if isinstance(value, dict) and value.get("IPAddress"):
+            return str(value["IPAddress"])
+    return None
+
+
+def host_port_from_info(info: dict[str, Any], container_port: int) -> int | None:
+    """Return the host port Docker currently publishes for ``container_port``.
+
+    This deliberately reads the live container state instead of trusting a
+    value cached in the control database: Docker reuses host ports as soon as a
+    container is removed, so a stale port can belong to a completely different
+    instance.
+    """
+    ports = (info.get("NetworkSettings") or {}).get("Ports") or {}
+    bindings = ports.get(f"{int(container_port)}/tcp")
+    if isinstance(bindings, list):
+        for binding in bindings:
+            if isinstance(binding, dict) and binding.get("HostPort"):
+                try:
+                    return int(binding["HostPort"])
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
+def instance_label(info: dict[str, Any]) -> str:
+    """Return the ``msm.instance`` label of a container, or "" when absent."""
+    labels = (info.get("Config") or {}).get("Labels") or {}
+    if not isinstance(labels, dict):
+        return ""
+    return str(labels.get("msm.instance") or "")
+
+
+def container_is_running(info: dict[str, Any]) -> bool:
+    return bool((info.get("State") or {}).get("Running"))

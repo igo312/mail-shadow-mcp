@@ -26,9 +26,15 @@ from typing import Any, Callable
 
 from .config import Config
 from .db import Database, now
-from .docker_cli import ContainerSpec, DockerClient, DockerError
+from .docker_cli import (
+    ContainerSpec,
+    DockerClient,
+    DockerError,
+    container_spec_hash,
+    instance_label,
+)
 from .imap_check import ImapError
-from .instance_config import render_instance_config
+from .instance_config import parse_instance_config, render_instance_config
 from .providers import (
     ImapSettings,
     InputError,
@@ -65,6 +71,14 @@ class ProvisionResult:
     reused: bool
     rotated: bool
     warning: str = ""
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    instance_id: str
+    email: str
+    action: str
+    message: str = ""
 
 
 class Provisioner:
@@ -127,7 +141,7 @@ class Provisioner:
         with self._lock_for(email):
             existing = self.db.get_instance_by_email(email)
             if existing:
-                return self._provision_existing(
+                result = self._provision_existing(
                     existing,
                     email=email,
                     password=password,
@@ -137,6 +151,33 @@ class Provisioner:
                     invite_id=invite_id,
                     ip=ip,
                 )
+                # Transfer status-page ownership only *after* the credentials
+                # were accepted (idempotency hash match or a successful IMAP
+                # login).  Doing it before authentication let any invite holder
+                # lock the real owner out of /instance/<id> by submitting a
+                # bogus password for a known mailbox.
+                owner = str(existing.get("owner_invite") or "")
+                if invite_id and owner != invite_id:
+                    self.db.set_instance_owner(existing["id"], invite_id)
+                    self.db.audit(
+                        "instance_owner_transferred",
+                        ip=ip,
+                        email=email,
+                        detail={
+                            "instance_id": existing["id"],
+                            "from_invite": owner,
+                            "to_invite": invite_id,
+                        },
+                    )
+                    refreshed = self.db.get_instance(existing["id"]) or existing
+                    return ProvisionResult(
+                        instance=refreshed,
+                        token=result.token,
+                        reused=result.reused,
+                        rotated=result.rotated,
+                        warning=result.warning,
+                    )
+                return result
             return self._provision_new(
                 email=email,
                 password=password,
@@ -173,6 +214,220 @@ class Provisioner:
         refreshed = self.db.get_instance(instance_id)
         assert refreshed is not None
         return refreshed
+
+    def reconcile_instance(
+        self,
+        instance_id: str,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+        update_config: bool = False,
+    ) -> ReconcileResult:
+        """Recreate an existing instance on the current image without user input.
+
+        The portal never stores the mailbox password.  The config volume does,
+        and it also contains the instance's current bearer token, so a rollout
+        can read it back, render an updated config (same password, same token,
+        new folder/trash settings) and recreate the container on the new image.
+        The data volume and the MCP token are preserved; clients keep working.
+
+        By default only the image is upgraded: the existing config volume is
+        reused verbatim so folder/trash behaviour does not change silently.
+        Pass ``update_config=True`` to apply the portal's current
+        MSM_SYNC_FOLDERS/MSM_TRASH_FOLDER settings.
+
+        This is intentionally conservative: if the config volume cannot be read
+        or parsed, the running container is left untouched.
+        """
+        instance = self.db.get_instance(instance_id)
+        if not instance:
+            raise ProvisionError("实例不存在", code="not_found")
+        if instance["status"] == "removed":
+            return ReconcileResult(instance_id, instance["email"], "skipped", "实例已删除")
+        if instance["status"] in {"provisioning", "updating"} and not force:
+            return ReconcileResult(
+                instance_id,
+                instance["email"],
+                "skipped",
+                "实例正在创建/更新中，请稍后重试",
+            )
+
+        with self._lock_for(instance["email"]):
+            instance = self.db.get_instance(instance_id)
+            if not instance:
+                raise ProvisionError("实例不存在", code="not_found")
+
+            name = instance["container_name"]
+            info = self.docker.inspect_container(name)
+            # Read the existing config with the image that created the volume
+            # (the running image).  If the container is gone, fall back to the
+            # configured image.
+            read_image = str(info.get("Image") or "") if info else ""
+            if not read_image:
+                read_image = self.config.docker_image
+            old_config = self.docker.read_config_volume(instance["config_volume"], read_image)
+            parsed = parse_instance_config(old_config)
+            password = str(parsed.get("password") or "")
+            token = str(parsed.get("bearer_token") or "")
+            if not password or password.startswith("$") or not token:
+                raise ProvisionError(
+                    "无法从实例 config 卷读取授权码或 MCP token；为避免破坏现有实例，已中止。",
+                    code="config_unreadable",
+                )
+            token_hash = self.tokens.hash_mcp_token(token)
+            token_mismatch = not constant_time_equal(token_hash, str(instance["token_hash"]))
+
+            settings = ImapSettings(
+                host=str(instance["imap_host"]),
+                port=int(instance["imap_port"]),
+                tls_mode=str(instance["tls_mode"]),
+                username=str(instance["email"]),
+                provider_key=str(instance.get("provider_key") or ""),
+                provider_name=str(instance.get("provider_name") or ""),
+                hint="",
+            )
+            sync_interval_min = int(parsed.get("sync_interval_min") or self.config.instance_sync_interval_min)
+            sync_jitter_sec = int(parsed.get("sync_jitter_sec") or self.config.instance_sync_jitter_sec)
+            tls_skip_verify = bool(parsed.get("tls_skip_verify"))
+            if update_config:
+                new_config = render_instance_config(
+                    email=str(instance["email"]),
+                    settings=settings,
+                    password=password,
+                    bearer_token=token,
+                    sync_interval_min=sync_interval_min,
+                    sync_jitter_sec=sync_jitter_sec,
+                    http_port=self.config.backend_port,
+                    folders=self.config.sync_folders,
+                    trash_folder=self.config.trash_folder,
+                    tls_skip_verify=tls_skip_verify,
+                )
+            else:
+                # Image-only upgrade: keep the existing config volume exactly as
+                # it is, so folders/trash/sync interval do not change.
+                new_config = old_config
+
+            target_image = self.docker.image_id(self.config.docker_image)
+            current_image = str((info or {}).get("Image") or "")
+            expected_spec_hash = container_spec_hash(self._container_spec(instance))
+            labels = ((info or {}).get("Config") or {}).get("Labels") or {}
+            spec_matches = isinstance(labels, dict) and labels.get("msm.spec") == expected_spec_hash
+            up_to_date = (
+                info is not None
+                and current_image == target_image
+                and old_config == new_config
+                and spec_matches
+            )
+            if up_to_date and not force:
+                repaired_token = False
+                if token_mismatch:
+                    if dry_run:
+                        return ReconcileResult(
+                            instance_id,
+                            instance["email"],
+                            "would_repair_token",
+                            "config 中的 token 与控制库不一致，需要修复路由哈希",
+                        )
+                    self._repair_token_hash(instance_id, instance["email"], token_hash)
+                    repaired_token = True
+                # Repair status/port drift without recreating a healthy
+                # container (e.g. after a portal crash mid-provision).
+                if instance["status"] != "running":
+                    self.db.set_instance_status(instance_id, "running", error=None)
+                if self.config.backend_mode == "port" and info is not None:
+                    host_port = self.docker.container_host_port(name, self.config.backend_port)
+                    if host_port and int(instance.get("host_port") or 0) != host_port:
+                        self.db.set_instance_host_port(instance_id, host_port)
+                if repaired_token:
+                    return ReconcileResult(
+                        instance_id,
+                        instance["email"],
+                        "token_repaired",
+                        "已修复 token 路由哈希；镜像/配置已是最新",
+                    )
+                return ReconcileResult(instance_id, instance["email"], "skipped", "已是最新镜像和配置")
+            if dry_run:
+                message = "配置或镜像需要更新"
+                if token_mismatch:
+                    message += "；config 中的 token 与控制库不一致，需要修复路由哈希"
+                return ReconcileResult(
+                    instance_id,
+                    instance["email"],
+                    "would_recreate",
+                    message,
+                )
+            if token_mismatch:
+                self._repair_token_hash(instance_id, instance["email"], token_hash)
+                instance = self.db.get_instance(instance_id) or instance
+
+            old_container_id = str((info or {}).get("Id") or "")
+            self.db.set_instance_status(instance_id, "updating")
+            try:
+                self._start(
+                    instance,
+                    password=password,
+                    settings=settings,
+                    token=token,
+                    sync_interval_min=sync_interval_min,
+                    sync_jitter_sec=sync_jitter_sec,
+                    tls_skip_verify=tls_skip_verify,
+                    write_config=update_config,
+                )
+            except ProvisionError as exc:
+                # If the old container was never replaced and is still running,
+                # keep routing to it instead of failing the instance just
+                # because an image/config write failed.  A new but unready
+                # container must not be marked healthy.
+                keep_running = False
+                try:
+                    current = self.docker.inspect_container(instance["container_name"])
+                    if current:
+                        same_container = old_container_id and str(current.get("Id") or "") == old_container_id
+                        keep_running = bool(same_container and (current.get("State") or {}).get("Running"))
+                except DockerError:
+                    keep_running = False
+                self.db.set_instance_status(
+                    instance_id,
+                    "running" if keep_running else "failed",
+                    error=exc.message,
+                )
+                self.db.audit(
+                    "instance_reconcile_failed",
+                    email=instance["email"],
+                    detail={
+                        "instance_id": instance_id,
+                        "error": exc.message,
+                        "kept_running": keep_running,
+                    },
+                )
+                raise
+            self.db.audit(
+                "instance_reconciled",
+                email=instance["email"],
+                detail={"instance_id": instance_id, "image": target_image},
+            )
+            message = (
+                "已使用当前镜像和配置重建"
+                if update_config
+                else "已使用当前镜像重建（保留原 config）"
+            )
+            return ReconcileResult(instance_id, instance["email"], "recreated", message)
+
+    def _repair_token_hash(self, instance_id: str, email: str, token_hash: str) -> None:
+        # The config volume is what the running container actually enforces.
+        # If a previous rotation updated the DB but failed before writing the
+        # config, the old token no longer routes.  Align the routing hash to the
+        # config so existing clients keep working.
+        log.warning(
+            "instance %s: config token does not match control DB; repairing routing hash",
+            instance_id,
+        )
+        self.db.set_instance_token_hash(instance_id, token_hash)
+        self.db.audit(
+            "instance_token_hash_repaired",
+            email=email,
+            detail={"instance_id": instance_id},
+        )
 
     # -- branches --------------------------------------------------------
     def _provision_existing(
@@ -295,11 +550,6 @@ class Provisioner:
         invite_id: str,
         ip: str,
     ) -> ProvisionResult:
-        if self.db.count_active_instances() >= self.config.max_instances:
-            raise ProvisionError(
-                "当前实例数量已达到部署上限，请联系管理员扩容或清理旧实例。",
-                code="capacity",
-            )
         self._validate_imap(settings, password)
         token = self.tokens.derive_mcp_token(email, password, token_salt)
         token_hash = self.tokens.hash_mcp_token(token)
@@ -320,12 +570,18 @@ class Provisioner:
             "tls_mode": settings.tls_mode,
             "provider_key": settings.provider_key,
             "provider_name": settings.provider_name,
+            "owner_invite": invite_id,
             "status": "provisioning",
             "last_error": None,
             "created_at": now(),
             "updated_at": now(),
         }
-        self.db.insert_instance(record)
+        reserved = self.db.reserve_instance(record, self.config.max_instances)
+        if reserved == "capacity":
+            raise ProvisionError(
+                "当前实例数量已达到部署上限，请联系管理员扩容或清理旧实例。",
+                code="capacity",
+            )
         instance = self.db.get_instance(instance_id)
         assert instance is not None
 
@@ -443,17 +699,8 @@ class Provisioner:
                 code="imap_auth",
             ) from exc
 
-    def _start(
-        self,
-        instance: dict[str, Any],
-        *,
-        password: str,
-        settings: ImapSettings,
-        token: str,
-    ) -> None:
-        self._write_config(instance, password=password, settings=settings, token=token)
-        self._remove_container_quietly(instance["container_name"])
-        spec = ContainerSpec(
+    def _container_spec(self, instance: dict[str, Any]) -> ContainerSpec:
+        return ContainerSpec(
             name=instance["container_name"],
             instance_id=instance["id"],
             network=self.config.docker_network
@@ -467,7 +714,35 @@ class Provisioner:
             pids=self.config.container_pids,
             container_port=self.config.backend_port,
             publish_loopback=self.config.backend_mode == "port",
+            gomemlimit=self.config.container_gomemlimit,
+            gogc=self.config.container_gogc,
+            gomaxprocs=self.config.container_gomaxprocs,
         )
+
+    def _start(
+        self,
+        instance: dict[str, Any],
+        *,
+        password: str,
+        settings: ImapSettings,
+        token: str,
+        sync_interval_min: int = 0,
+        sync_jitter_sec: int = 0,
+        tls_skip_verify: bool = False,
+        write_config: bool = True,
+    ) -> None:
+        if write_config:
+            self._write_config(
+                instance,
+                password=password,
+                settings=settings,
+                token=token,
+                sync_interval_min=sync_interval_min,
+                sync_jitter_sec=sync_jitter_sec,
+                tls_skip_verify=tls_skip_verify,
+            )
+        self._remove_container_quietly(instance["container_name"])
+        spec = self._container_spec(instance)
         try:
             container_id = self.docker.run_container(spec)
         except DockerError as exc:
@@ -530,6 +805,30 @@ class Provisioner:
         if info:
             state = info.get("State") or {}
             if state.get("Running"):
+                # A running container is only reusable if it is the container
+                # this instance owns.  Docker names are unique, but a manually
+                # recreated container can carry a different instance label or
+                # sit on the wrong network after a backend-mode migration.
+                owner = instance_label(info)
+                if owner and owner != str(instance["id"]):
+                    log.warning(
+                        "container %s belongs to %s, recreating for %s",
+                        name,
+                        owner,
+                        instance["id"],
+                    )
+                    self._start(instance, password=password, settings=settings, token=token)
+                    return self.db.get_instance(instance["id"]) or instance
+                if self.config.backend_mode in {"network", "ip"}:
+                    networks = (info.get("NetworkSettings") or {}).get("Networks") or {}
+                    if self.config.docker_network not in networks:
+                        log.warning(
+                            "container %s is not attached to %s, recreating",
+                            name,
+                            self.config.docker_network,
+                        )
+                        self._start(instance, password=password, settings=settings, token=token)
+                        return self.db.get_instance(instance["id"]) or instance
                 if self.config.backend_mode == "port":
                     host_port = self.docker.container_host_port(
                         name, self.config.backend_port
@@ -584,13 +883,25 @@ class Provisioner:
         password: str,
         settings: ImapSettings,
         token: str,
+        sync_interval_min: int = 0,
+        sync_jitter_sec: int = 0,
+        tls_skip_verify: bool = False,
     ) -> None:
+        if sync_interval_min <= 0:
+            sync_interval_min = self.config.instance_sync_interval_min
+        if sync_jitter_sec <= 0:
+            sync_jitter_sec = self.config.instance_sync_jitter_sec
         content = render_instance_config(
             email=instance["email"],
             settings=settings,
             password=password,
             bearer_token=token,
+            sync_interval_min=sync_interval_min,
+            sync_jitter_sec=sync_jitter_sec,
             http_port=self.config.backend_port,
+            folders=self.config.sync_folders,
+            trash_folder=self.config.trash_folder,
+            tls_skip_verify=tls_skip_verify,
         )
         try:
             self.docker.write_config_volume(

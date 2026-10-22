@@ -62,6 +62,19 @@ def main(argv: list[str] | None = None) -> int:
     remove = instance_sub.add_parser("remove", help="stop and remove an instance")
     remove.add_argument("id")
     remove.add_argument("--purge-data", action="store_true", help="also delete the mail database volume")
+    reconcile = instance_sub.add_parser(
+        "reconcile",
+        help="recreate existing containers on the current image/config without user input",
+    )
+    reconcile.add_argument("--all", action="store_true", help="reconcile every non-removed instance")
+    reconcile.add_argument("--id", help="reconcile one instance by ID")
+    reconcile.add_argument("--force", action="store_true", help="recreate even if image and config match")
+    reconcile.add_argument("--dry-run", action="store_true", help="show what would be recreated")
+    reconcile.add_argument(
+        "--update-config",
+        action="store_true",
+        help="also apply current MSM_SYNC_FOLDERS/MSM_TRASH_FOLDER (default: keep the existing config)",
+    )
 
     sub.add_parser("doctor", help="check Docker, storage and configuration")
 
@@ -122,13 +135,14 @@ def _invite_command(args: argparse.Namespace, config: Config, db: Database, toke
                 item["id"],
                 item["label"] or "-",
                 f"{item['uses']}/{item['max_uses']}",
+                str(item.get("mailbox_count", 0)),
                 "never" if item["expires_at"] is None else _fmt_time(item["expires_at"]),
                 "yes" if item["disabled"] else "no",
                 _fmt_time(item["created_at"]),
             ]
             for item in invites
         ]
-        _print_table(["id", "label", "uses", "expires", "disabled", "created"], rows)
+        _print_table(["id", "label", "sessions", "mailboxes", "expires", "disabled", "created"], rows)
         return 0
 
     if args.invite_command == "disable":
@@ -162,6 +176,40 @@ def _instance_command(args: argparse.Namespace, config: Config, db: Database, to
         _print_table(["id", "email", "status", "container", "loopback_port", "created", "last_seen"], rows)
         return 0
 
+    if args.instance_command == "reconcile":
+        if bool(args.all) == bool(args.id):
+            print("specify exactly one of --all or --id", file=sys.stderr)
+            return 2
+        docker = DockerClient(config.docker_bin)
+        provisioner = Provisioner(config, db, docker, tokens)
+        if args.all:
+            targets = [item for item in db.list_instances() if item["status"] != "removed"]
+        else:
+            target = db.get_instance(args.id)
+            if not target:
+                print(f"instance not found: {args.id}", file=sys.stderr)
+                return 1
+            targets = [target]
+        if not targets:
+            print("no instances to reconcile")
+            return 0
+        failures = 0
+        print("id  email  action  message")
+        for item in targets:
+            try:
+                result = provisioner.reconcile_instance(
+                    item["id"],
+                    force=args.force,
+                    dry_run=args.dry_run,
+                    update_config=args.update_config,
+                )
+            except Exception as exc:
+                failures += 1
+                print(f"{item['id']}  {item['email']}  failed  {exc}", file=sys.stderr)
+                continue
+            print(f"{result.instance_id}  {result.email}  {result.action}  {result.message}")
+        return 1 if failures else 0
+
     if args.instance_command == "remove":
         docker = DockerClient(config.docker_bin)
         provisioner = Provisioner(config, db, docker, tokens)
@@ -184,7 +232,7 @@ def _doctor(config: Config, db: Database) -> int:
     print(f"docker_network: {config.docker_network}")
     print(f"docker_image:   {config.docker_image}")
     print(f"backend_mode:   {config.backend_mode}")
-    print(f"max_instances:  {config.max_instances}")
+    print(f"max_instances:  {config.max_instances or 'unlimited'}")
     print(f"master_key:     {len(config.master_key)} bytes")
 
     try:

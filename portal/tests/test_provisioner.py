@@ -4,12 +4,13 @@ import os
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from app.config import Config
 from app.db import Database
-from app.docker_cli import DockerError
+from app.docker_cli import DockerError, container_spec_hash
 from app.imap_check import ImapAuthError
 from app.provisioner import Provisioner, ProvisionError
 from app.security import TokenService
@@ -22,14 +23,24 @@ class FakeDocker:
         self.runs: list = []
         self.removed: list[str] = []
         self.volumes_removed: list[str] = []
+        self.image_id_value = "sha256:test-image"
 
     def write_config_volume(self, volume: str, image: str, content: str) -> None:
         self.configs[volume] = content
 
+    def read_config_volume(self, volume: str, image: str) -> str:
+        return self.configs[volume]
+
+    def image_id(self, image: str) -> str:
+        return self.image_id_value
+
     def run_container(self, spec):
         self.runs.append(spec)
         self.containers[spec.name] = {
+            "Id": f"cid-{len(self.runs)}",
+            "Image": self.image_id_value,
             "State": {"Running": True, "Status": "running"},
+            "Config": {"Labels": {"msm.instance": spec.instance_id, "msm.spec": container_spec_hash(spec)}},
             "NetworkSettings": {"Networks": {spec.network: {"IPAddress": "127.0.0.1"}}},
         }
         return f"cid-{len(self.runs)}"
@@ -108,7 +119,10 @@ class ProvisionerTest(unittest.TestCase):
         self.assertEqual(len(docker.runs), 1)
         self.assertIn(first.token, docker.configs[first.instance["config_volume"]])
         self.assertIn('password: "abcdefgh"', docker.configs[first.instance["config_volume"]])
+        self.assertIn("sync_interval_min: 30", docker.configs[first.instance["config_volume"]])
+        self.assertIn("sync_jitter_sec: 1800", docker.configs[first.instance["config_volume"]])
         self.assertIsNotNone(self.db.get_instance_by_token_hash(tokens.hash_mcp_token(first.token)))
+        self.assertEqual(first.instance["owner_invite"], "inv")
 
         second = provisioner.provision("user@gmail.com", "abcd efgh")
         self.assertTrue(second.reused)
@@ -116,6 +130,36 @@ class ProvisionerTest(unittest.TestCase):
         self.assertEqual(len(docker.runs), 1)
         self.assertEqual(second.token, first.token)
         self.assertEqual(second.instance["id"], first.instance["id"])
+
+    def test_foreign_invite_with_bad_password_does_not_transfer_owner(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "old-password", invite_id="inv-a")
+        with self.assertRaises(ProvisionError) as ctx:
+            provisioner.provision("user@gmail.com", "bad-password", invite_id="inv-b")
+        self.assertEqual(ctx.exception.code, "imap_auth")
+        # The failed attempt must not move the status page to the attacker.
+        self.assertEqual(
+            self.db.get_instance(first.instance["id"])["owner_invite"], "inv-a"
+        )
+        self.assertEqual(len(docker.runs), 1)
+
+    def test_foreign_invite_with_valid_credentials_transfers_owner(self) -> None:
+        _, _, _, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "old-password", invite_id="inv-a")
+        second = provisioner.provision(
+            "user@gmail.com", "new-password", invite_id="inv-b"
+        )
+        self.assertEqual(second.instance["id"], first.instance["id"])
+        self.assertEqual(second.instance["owner_invite"], "inv-b")
+        self.assertTrue(second.rotated)
+
+    def test_same_credentials_from_another_invite_keeps_token_and_transfers(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password", invite_id="inv-a")
+        second = provisioner.provision("user@gmail.com", "password", invite_id="inv-b")
+        self.assertEqual(second.token, first.token)
+        self.assertEqual(second.instance["owner_invite"], "inv-b")
+        self.assertEqual(len(docker.runs), 1)
 
     def test_password_rotation_invalidates_old_token(self) -> None:
         _, docker, tokens, provisioner = self._provisioner()
@@ -152,6 +196,16 @@ class ProvisionerTest(unittest.TestCase):
             provisioner.provision("user@gmail.com", "bad-password")
         self.assertEqual(self.db.count_active_instances(), 0)
         self.assertEqual(len(docker.runs), 0)
+
+    def test_one_invite_can_create_multiple_mailboxes(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        invite_id = self.db.create_invite("hash-invite", max_uses=1)
+        first = provisioner.provision("one@gmail.com", "password", invite_id=invite_id)
+        second = provisioner.provision("two@gmail.com", "password", invite_id=invite_id)
+        self.assertNotEqual(first.instance["id"], second.instance["id"])
+        self.assertEqual(first.instance["owner_invite"], invite_id)
+        self.assertEqual(second.instance["owner_invite"], invite_id)
+        self.assertEqual(len(docker.runs), 2)
 
     def test_capacity_limit(self) -> None:
         _, _, _, provisioner = self._provisioner(MSM_MAX_INSTANCES=1)
@@ -230,6 +284,180 @@ class ProvisionerTest(unittest.TestCase):
                 tls_mode="none",
             )
         self.assertEqual(ctx.exception.code, "insecure_imap")
+
+
+    def test_running_container_on_wrong_network_is_recreated(self) -> None:
+        _, docker, _, provisioner = self._provisioner(MSM_BACKEND_MODE="network")
+        first = provisioner.provision("user@gmail.com", "password")
+        name = first.instance["container_name"]
+        # Simulate a container that was created before the operator switched
+        # from port mode to network mode: it is running but not attached to
+        # msm-net, so the gateway's DNS lookup would fail forever.
+        docker.containers[name]["NetworkSettings"] = {"Networks": {}}
+
+        again = provisioner.provision("user@gmail.com", "password")
+        self.assertTrue(again.reused)
+        self.assertEqual(len(docker.runs), 2)
+        self.assertIn("msm-test", docker.containers[name]["NetworkSettings"]["Networks"])
+
+    def test_running_container_with_foreign_instance_label_is_recreated(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password")
+        name = first.instance["container_name"]
+        docker.containers[name]["Config"]["Labels"]["msm.instance"] = "f" * 16
+
+        again = provisioner.provision("user@gmail.com", "password")
+        self.assertTrue(again.reused)
+        self.assertEqual(len(docker.runs), 2)
+        self.assertEqual(
+            docker.containers[name]["Config"]["Labels"]["msm.instance"],
+            first.instance["id"],
+        )
+
+
+    def test_reconcile_dry_run_does_not_mutate(self) -> None:
+        _, docker, tokens, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password")
+        volume = first.instance["config_volume"]
+        docker.configs[volume] = docker.configs[volume].replace(
+            'http_bearer_token: "' + first.token + '"',
+            'http_bearer_token: "other-token"',
+        )
+        docker.image_id_value = "sha256:new-image"
+        docker.containers[first.instance["container_name"]]["Image"] = "sha256:old-image"
+
+        result = provisioner.reconcile_instance(first.instance["id"], dry_run=True)
+        self.assertEqual(result.action, "would_recreate")
+        self.assertEqual(len(docker.runs), 1)
+        self.assertIsNotNone(
+            self.db.get_instance_by_token_hash(tokens.hash_mcp_token(first.token))
+        )
+
+    def test_reconcile_recreates_on_new_image_and_preserves_token(self) -> None:
+        _, docker, tokens, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password")
+        volume = first.instance["config_volume"]
+        name = first.instance["container_name"]
+        # Simulate a config written by the previous portal version: no folders.
+        docker.configs[volume] = "\n".join(
+            line for line in docker.configs[volume].splitlines()
+            if not line.strip().startswith(("folders:", "idle_folders:"))
+        ) + "\n"
+        docker.image_id_value = "sha256:new-image"
+        docker.containers[name]["Image"] = "sha256:old-image"
+
+        result = provisioner.reconcile_instance(first.instance["id"], update_config=True)
+        self.assertEqual(result.action, "recreated")
+        self.assertEqual(len(docker.runs), 2)
+        self.assertIn('folders: ["INBOX"]', docker.configs[volume])
+        self.assertIn(first.token, docker.configs[volume])
+        refreshed = self.db.get_instance(first.instance["id"])
+        self.assertEqual(refreshed["status"], "running")
+        self.assertEqual(refreshed["token_hash"], tokens.hash_mcp_token(first.token))
+
+    def test_reconcile_image_only_keeps_existing_config(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password")
+        volume = first.instance["config_volume"]
+        name = first.instance["container_name"]
+        docker.configs[volume] = "\n".join(
+            line for line in docker.configs[volume].splitlines()
+            if not line.strip().startswith(("folders:", "idle_folders:"))
+        ) + "\n"
+        old_config = docker.configs[volume]
+        docker.image_id_value = "sha256:new-image"
+        docker.containers[name]["Image"] = "sha256:old-image"
+
+        result = provisioner.reconcile_instance(first.instance["id"])
+        self.assertEqual(result.action, "recreated")
+        self.assertEqual(docker.configs[volume], old_config)
+        self.assertIn(first.token, docker.configs[volume])
+
+    def test_reconcile_recreates_when_container_memory_changes(self) -> None:
+        config, docker, tokens, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password")
+        self.assertEqual(first.instance["status"], "running")
+
+        smaller = replace(config, container_memory="96m")
+        provisioner2 = Provisioner(smaller, self.db, docker, tokens, imap_checker=self._checker)
+        result = provisioner2.reconcile_instance(first.instance["id"])
+        self.assertEqual(result.action, "recreated")
+        self.assertEqual(len(docker.runs), 2)
+        self.assertEqual(docker.runs[-1].memory, "96m")
+
+    def test_reconcile_skips_when_image_and_config_match(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password")
+        self.assertEqual(first.instance["status"], "running")
+        result = provisioner.reconcile_instance(first.instance["id"])
+        self.assertEqual(result.action, "skipped")
+        self.assertEqual(len(docker.runs), 1)
+
+    def test_reconcile_recreates_missing_container(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password")
+        name = first.instance["container_name"]
+        docker.containers.pop(name)
+        docker.image_id_value = "sha256:new-image"
+
+        result = provisioner.reconcile_instance(first.instance["id"])
+        self.assertEqual(result.action, "recreated")
+        self.assertEqual(len(docker.runs), 2)
+        self.assertIn(name, docker.containers)
+
+    def test_reconcile_aborts_without_password_and_keeps_container(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password")
+        volume = first.instance["config_volume"]
+        name = first.instance["container_name"]
+        docker.configs[volume] = "\n".join(
+            line for line in docker.configs[volume].splitlines()
+            if not line.strip().startswith("password:")
+        ) + "\n"
+        docker.image_id_value = "sha256:new-image"
+
+        with self.assertRaises(ProvisionError) as ctx:
+            provisioner.reconcile_instance(first.instance["id"])
+        self.assertEqual(ctx.exception.code, "config_unreadable")
+        self.assertEqual(len(docker.runs), 1)
+        self.assertIn(name, docker.containers)
+        self.assertEqual(self.db.get_instance(first.instance["id"])["status"], "running")
+
+    def test_reconcile_write_failure_keeps_old_container_running(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password")
+        name = first.instance["container_name"]
+        docker.image_id_value = "sha256:new-image"
+        docker.containers[name]["Image"] = "sha256:old-image"
+
+        def fail_write(volume, image, content):
+            raise DockerError("write config volume", "disk full")
+
+        docker.write_config_volume = fail_write
+        with self.assertRaises(ProvisionError):
+            provisioner.reconcile_instance(first.instance["id"], update_config=True)
+        self.assertEqual(len(docker.runs), 1)
+        self.assertIn(name, docker.containers)
+        self.assertEqual(self.db.get_instance(first.instance["id"])["status"], "running")
+
+    def test_reconcile_repairs_db_token_hash_from_config(self) -> None:
+        _, docker, tokens, provisioner = self._provisioner()
+        first = provisioner.provision("user@gmail.com", "password")
+        volume = first.instance["config_volume"]
+        docker.configs[volume] = docker.configs[volume].replace(
+            'http_bearer_token: "' + first.token + '"',
+            'http_bearer_token: "some-other-token"',
+        )
+        docker.image_id_value = "sha256:new-image"
+        docker.containers[first.instance["container_name"]]["Image"] = "sha256:old-image"
+
+        result = provisioner.reconcile_instance(first.instance["id"])
+        self.assertEqual(result.action, "recreated")
+        self.assertEqual(len(docker.runs), 2)
+        self.assertIsNotNone(
+            self.db.get_instance_by_token_hash(tokens.hash_mcp_token("some-other-token"))
+        )
+        self.assertIsNone(self.db.get_instance_by_token_hash(tokens.hash_mcp_token(first.token)))
 
 
 if __name__ == "__main__":

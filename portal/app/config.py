@@ -102,12 +102,19 @@ class Config:
     allow_any_imap_port: bool = False
     trust_proxy: bool = False
 
-    max_instances: int = 25
+    max_instances: int = 0  # 0 = unlimited
     session_ttl_seconds: int = 7200
     flash_ttl_seconds: int = 900
-    container_memory: str = "512m"
+    container_memory: str = "128m"
     container_cpus: str = "1.0"
-    container_pids: int = 256
+    container_pids: int = 128
+    container_gomemlimit: str = "48MiB"
+    container_gogc: str = "50"
+    container_gomaxprocs: str = "1"
+    instance_sync_interval_min: int = 30
+    instance_sync_jitter_sec: int = 1800
+    sync_folders: tuple[str, ...] = ("INBOX",)
+    trash_folder: str = ""
     log_level: str = "INFO"
 
     invite_rate_limit: int = 12
@@ -116,6 +123,7 @@ class Config:
     provision_rate_window: int = 3600
     gateway_rate_limit: int = 120
     gateway_rate_window: int = 60
+    gateway_timeout_seconds: int = 120
 
     bootstrap_invite: str = field(default="", repr=False)
     bootstrap_invite_uses: int = 1
@@ -136,6 +144,18 @@ class Config:
         backend_mode = _env("MSM_BACKEND_MODE", "port").lower()
         if backend_mode not in {"network", "ip", "port"}:
             raise ConfigError("MSM_BACKEND_MODE must be 'network', 'ip' or 'port'")
+
+        raw_folders = _env("MSM_SYNC_FOLDERS", "INBOX")
+        if raw_folders.strip().upper() in {"ALL", "*"}:
+            # Empty tuple means "no folders filter" in the instance config, i.e.
+            # sync every folder the server reports.
+            sync_folders: tuple[str, ...] = ()
+        else:
+            sync_folders = tuple(
+                part.strip() for part in raw_folders.split(",") if part.strip()
+            )
+            if not sync_folders:
+                sync_folders = ("INBOX",)
 
         try:
             master_key = _load_master_key(data_dir)
@@ -160,12 +180,19 @@ class Config:
             allow_private_imap=_env_bool("MSM_ALLOW_PRIVATE_IMAP", False),
             allow_any_imap_port=_env_bool("MSM_ALLOW_ANY_IMAP_PORT", False),
             trust_proxy=_env_bool("MSM_TRUST_PROXY", False),
-            max_instances=_env_int("MSM_MAX_INSTANCES", 25, 1),
+            max_instances=_env_int("MSM_MAX_INSTANCES", 0, 0),
             session_ttl_seconds=_env_int("MSM_SESSION_TTL", 7200, 60),
             flash_ttl_seconds=_env_int("MSM_FLASH_TTL", 900, 60),
-            container_memory=_env("MSM_CONTAINER_MEMORY", "512m"),
+            container_memory=_env("MSM_CONTAINER_MEMORY", "128m"),
             container_cpus=_env("MSM_CONTAINER_CPUS", "1.0"),
-            container_pids=_env_int("MSM_CONTAINER_PIDS", 256, 32),
+            container_pids=_env_int("MSM_CONTAINER_PIDS", 128, 32),
+            container_gomemlimit=_env("MSM_CONTAINER_GOMEMLIMIT", "48MiB"),
+            container_gogc=_env("MSM_CONTAINER_GOGC", "50"),
+            container_gomaxprocs=_env("MSM_CONTAINER_GOMAXPROCS", "1"),
+            instance_sync_interval_min=_env_int("MSM_SYNC_INTERVAL_MIN", 30, 5),
+            instance_sync_jitter_sec=_env_int("MSM_SYNC_JITTER_SEC", 1800, 0),
+            sync_folders=sync_folders,
+            trash_folder=os.environ.get("MSM_TRASH_FOLDER", "").strip(),
             log_level=_env("MSM_LOG_LEVEL", "INFO").upper(),
             invite_rate_limit=_env_int("MSM_INVITE_RATE_LIMIT", 12, 1),
             invite_rate_window=_env_int("MSM_INVITE_RATE_WINDOW", 900, 1),
@@ -173,6 +200,7 @@ class Config:
             provision_rate_window=_env_int("MSM_PROVISION_RATE_WINDOW", 3600, 1),
             gateway_rate_limit=_env_int("MSM_GATEWAY_RATE_LIMIT", 120, 1),
             gateway_rate_window=_env_int("MSM_GATEWAY_RATE_WINDOW", 60, 1),
+            gateway_timeout_seconds=_env_int("MSM_GATEWAY_TIMEOUT", 120, 5),
             bootstrap_invite=os.environ.get("MSM_BOOTSTRAP_INVITE", "").strip(),
             bootstrap_invite_uses=_env_int("MSM_BOOTSTRAP_INVITE_USES", 1, 1),
             bootstrap_invite_days=_env_int("MSM_BOOTSTRAP_INVITE_DAYS", 7, 1),

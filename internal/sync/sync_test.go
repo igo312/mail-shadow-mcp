@@ -10,9 +10,13 @@ package imapsync
 
 import (
 	"database/sql"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/dryas/mail-shadow-mcp/internal/config"
 	"github.com/dryas/mail-shadow-mcp/internal/db"
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -374,5 +378,220 @@ func TestInsertAttachment_And_Query(t *testing.T) {
 	}
 	if fn != "doc.pdf" || sz != 512 {
 		t.Errorf("got filename=%q size=%d", fn, sz)
+	}
+}
+
+// When the server changes UIDVALIDITY the old rows must be purged from all
+// three tables.  mail_content and mail_content_fts have no foreign key to
+// mail_entries, so deleting only mail_entries used to leave stale bodies and
+// duplicate FTS documents behind.
+func TestCheckAndResetUIDValidity_PurgesIndexRows(t *testing.T) {
+	database := openTestDB(t)
+	const account, folder = "test@example.com", "INBOX"
+	if _, err := database.Exec(`INSERT INTO mail_entries
+		(id, account_id, imap_uid, imap_folder, subject, sender)
+		VALUES ('e1', ?, 1, ?, 'old', 'a@b.c')`, account, folder); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO mail_content (entry_id, body_text) VALUES ('e1', 'old body')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO mail_content_fts (entry_id, subject, body_text) VALUES ('e1', 'old', 'old body')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO mail_cjk_fts (entry_id, text) VALUES ('e1', '旧 邮 件')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO sync_state
+		(account_id, imap_folder, last_uid, uid_validity) VALUES (?, ?, 1, 100)`, account, folder); err != nil {
+		t.Fatal(err)
+	}
+
+	last, err := checkAndResetUIDValidity(database, slog.Default(), account, folder, 1, &imap.SelectData{UIDValidity: 200})
+	if err != nil {
+		t.Fatalf("checkAndResetUIDValidity: %v", err)
+	}
+	if last != 0 {
+		t.Fatalf("expected last UID 0 after reset, got %d", last)
+	}
+	for _, table := range []string{"mail_entries", "mail_content", "mail_content_fts", "mail_cjk_fts"} {
+		var n int
+		if err := database.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if n != 0 {
+			t.Errorf("%s still has %d row(s) after UIDVALIDITY purge", table, n)
+		}
+	}
+	var validity uint32
+	var lastUID uint32
+	if err := database.QueryRow(`SELECT uid_validity, last_uid FROM sync_state WHERE account_id=? AND imap_folder=?`,
+		account, folder).Scan(&validity, &lastUID); err != nil {
+		t.Fatal(err)
+	}
+	if validity != 200 || lastUID != 0 {
+		t.Errorf("sync_state: got validity=%d last_uid=%d, want 200/0", validity, lastUID)
+	}
+}
+
+func TestTextSections_HTMLOnlyFallsBackToHTML(t *testing.T) {
+	bs := &imap.BodyStructureMultiPart{
+		Children: []imap.BodyStructure{
+			&imap.BodyStructureSinglePart{Type: "text", Subtype: "html", Encoding: "quoted-printable"},
+		},
+		Subtype: "mixed",
+	}
+	sections := textSections(bs)
+	if len(sections) != 1 {
+		t.Fatalf("expected the HTML part, got %d section(s)", len(sections))
+	}
+	if got := sections[0].Part; len(got) != 1 || got[0] != 1 {
+		t.Errorf("part path: want [1], got %v", got)
+	}
+}
+
+func TestExtractTextFromSections_StripsHTML(t *testing.T) {
+	section := &imap.FetchItemBodySection{Part: []int{1}, Peek: true}
+	bs := &imap.BodyStructureMultiPart{
+		Children: []imap.BodyStructure{
+			&imap.BodyStructureSinglePart{Type: "text", Subtype: "html", Encoding: "7BIT"},
+		},
+		Subtype: "mixed",
+	}
+	msg := &imapclient.FetchMessageBuffer{
+		BodySection: []imapclient.FetchBodySectionBuffer{{
+			Section: section,
+			Bytes:   []byte(`<html><style>p{color:red}</style><body><p>Hello&nbsp;<b>world</b></p><script>x()</script></body></html>`),
+		}},
+	}
+	got := extractTextFromSections(bs, msg)
+	if got != "Hello world" {
+		t.Errorf("want %q, got %q", "Hello world", got)
+	}
+}
+
+func TestHTMLToText(t *testing.T) {
+	got := htmlToText(`<p>Hello&nbsp;<b>world</b> &amp; friends</p><!-- c -->`)
+	if got != "Hello world & friends" {
+		t.Errorf("htmlToText: got %q", got)
+	}
+}
+
+func TestMergeFTS_BoundedCommand(t *testing.T) {
+	database := openTestDB(t)
+	for i := 0; i < 50; i++ {
+		if _, err := database.Exec(`INSERT INTO mail_content_fts (entry_id, subject, body_text) VALUES (?,?,?)`,
+			fmt.Sprintf("e%d", i), "subject", "body"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mergeFTS(database, slog.Default(), 10)
+	var n int
+	if err := database.QueryRow(`SELECT count(*) FROM mail_content_fts WHERE mail_content_fts MATCH 'body'`).Scan(&n); err != nil {
+		t.Fatalf("FTS query after merge: %v", err)
+	}
+	if n != 50 {
+		t.Errorf("expected 50 FTS rows, got %d", n)
+	}
+}
+
+func TestBackfillCJK_IndexesExistingRows(t *testing.T) {
+	database := openTestDB(t)
+	const account, folder = "acc1", "INBOX"
+	for i, item := range []struct{ subject, body string }{
+		{"关于财务的通知", "正文内容"},
+		{"Weekly report", "plain body"},
+	} {
+		id := fmt.Sprintf("%s:%s:%d", account, folder, i+1)
+		if _, err := database.Exec(`INSERT INTO mail_entries
+			(id, account_id, imap_uid, imap_folder, subject, sender)
+			VALUES (?, ?, ?, ?, ?, 'a@b.c')`, id, account, i+1, folder, item.subject); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Exec(`INSERT INTO mail_content (entry_id, body_text, cjk_indexed)
+			VALUES (?, ?, 0)`, id, item.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	client := &Client{cfg: config.AccountConfig{ID: account}}
+	if err := client.backfillCJK(database, slog.Default(), folder); err != nil {
+		t.Fatalf("backfillCJK: %v", err)
+	}
+
+	var cjkRows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM mail_cjk_fts`).Scan(&cjkRows); err != nil {
+		t.Fatal(err)
+	}
+	if cjkRows != 1 {
+		t.Errorf("expected 1 CJK-indexed row, got %d", cjkRows)
+	}
+	var pending int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM mail_content WHERE cjk_indexed = 0`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Errorf("expected all rows marked indexed, %d pending", pending)
+	}
+}
+
+func TestIndexNewMessage_PopulatesCJKIndex(t *testing.T) {
+	database := openTestDB(t)
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmts, err := prepareBatchStmts(tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := mailEntry{ID: "e1", Subject: "关于财务的通知"}
+	if err := indexNewMessage(tx, stmts, entry, &imapclient.FetchMessageBuffer{}, "正文内容", 1); err != nil {
+		t.Fatalf("indexNewMessage: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	var cjkRows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM mail_cjk_fts WHERE mail_cjk_fts MATCH ?`, `"通 知"`).Scan(&cjkRows); err != nil {
+		t.Fatal(err)
+	}
+	if cjkRows != 1 {
+		t.Errorf("expected the CJK index to contain the new message, got %d", cjkRows)
+	}
+	var indexed int
+	if err := database.QueryRow(`SELECT cjk_indexed FROM mail_content WHERE entry_id = 'e1'`).Scan(&indexed); err != nil {
+		t.Fatal(err)
+	}
+	if indexed != 1 {
+		t.Errorf("cjk_indexed = %d, want 1", indexed)
+	}
+}
+
+func TestIndexNewMessage_CapsStoredBody(t *testing.T) {
+	database := openTestDB(t)
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmts, err := prepareBatchStmts(tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Repeat("x", maxStoredBodyBytes*2)
+	entry := mailEntry{ID: "e1", Subject: "big"}
+	if err := indexNewMessage(tx, stmts, entry, &imapclient.FetchMessageBuffer{}, body, 1); err != nil {
+		t.Fatalf("indexNewMessage: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var stored int
+	if err := database.QueryRow(`SELECT length(body_text) FROM mail_content WHERE entry_id = 'e1'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != maxStoredBodyBytes {
+		t.Errorf("stored body length = %d, want %d", stored, maxStoredBodyBytes)
 	}
 }

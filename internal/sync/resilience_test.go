@@ -268,8 +268,8 @@ func TestParseRawMessage_SinglePartBase64(t *testing.T) {
 	}
 }
 
-func TestParseRawMessage_HTMLOnlyIgnored(t *testing.T) {
-	// HTML-only mail must not put markup into the full-text index.
+func TestParseRawMessage_HTMLOnlyIsConvertedToText(t *testing.T) {
+	// HTML-only mail contributes readable text, but never raw markup.
 	raw := strings.Join([]string{
 		`From: a@b.c`,
 		`Subject: html only`,
@@ -287,8 +287,8 @@ func TestParseRawMessage_HTMLOnlyIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseRawMessage: %v", err)
 	}
-	if msg.Text != "" {
-		t.Errorf("expected empty text, got %q", msg.Text)
+	if msg.Text != "hi" {
+		t.Errorf("expected stripped text %q, got %q", "hi", msg.Text)
 	}
 }
 

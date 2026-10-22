@@ -74,3 +74,28 @@ func TestSubstringMatchArgs(t *testing.T) {
 		}
 	}
 }
+
+func TestCJKIndexText(t *testing.T) {
+	got := CJKIndexText("关于2026年度财务结算的通知")
+	want := "关 于 2026 年 度 财 务 结 算 的 通 知 "
+	if got != want {
+		t.Errorf("CJKIndexText: got %q, want %q", got, want)
+	}
+	if got := CJKIndexText("plain english"); got != "plain english" {
+		t.Errorf("non-CJK text must be unchanged, got %q", got)
+	}
+}
+
+func TestCJKFTSQuery(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"通知", `"通 知"`},
+		{"财务结算", `"财 务 结 算"`},
+		{"关于 2026 财务", `"关 于" "2026" "财 务"`},
+		{"Re: 通知", `"Re:" "通 知"`},
+	}
+	for _, tt := range tests {
+		if got := CJKFTSQuery(tt.in); got != tt.want {
+			t.Errorf("CJKFTSQuery(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}

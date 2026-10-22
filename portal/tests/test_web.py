@@ -305,6 +305,21 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("user@example.com", text)
         self.assertNotIn("secret-pw", text)
 
+    def test_instance_page_is_owner_only(self) -> None:
+        self._make_invite()
+        self._enter()
+        session = self.tokens.parse_session(self.client.cookies["msm_session"])
+        instance_id = self.provisioner.instance_id
+
+        self.db.set_instance_owner(instance_id, "other-invite")
+        status, _, _ = self.client.get(f"/instance/{instance_id}")
+        self.assertEqual(status, 404)
+
+        self.db.set_instance_owner(instance_id, session["invite"])
+        status, _, data = self.client.get(f"/instance/{instance_id}")
+        self.assertEqual(status, 200)
+        self.assertIn("实例", data.decode("utf-8"))
+
     def test_gateway_path_bypasses_session(self) -> None:
         status, _, data = self.client.get("/mcp")
         self.assertEqual(status, 200)

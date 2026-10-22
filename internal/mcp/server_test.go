@@ -12,6 +12,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -402,5 +403,135 @@ func TestHandleDeleteMail_InvalidEmailID(t *testing.T) {
 
 	if !strings.Contains(out, "invalid email_id format") {
 		t.Errorf("expected format error, got: %s", out)
+	}
+}
+
+func TestHandleGetEmailContent_TruncatesHugeBody(t *testing.T) {
+	database := openTestDB(t)
+	seedEntry(t, database, "acc1:INBOX:1", "acc1", "INBOX", "Big", "a@example.com", 1)
+	body := strings.Repeat("x", maxEmailBodyRunes*2)
+	if _, err := database.Exec(`INSERT INTO mail_content (entry_id, body_text) VALUES ('acc1:INBOX:1', ?)`, body); err != nil {
+		t.Fatal(err)
+	}
+	h := handleGetEmailContent(database)
+	out := callTool(t, h, map[string]any{"entry_id": "acc1:INBOX:1"})
+
+	var result mailDetail
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("JSON parse: %v", err)
+	}
+	if !strings.HasSuffix(result.BodyText, "[... truncated]") {
+		t.Errorf("expected truncation marker, got suffix %q", result.BodyText[len(result.BodyText)-20:])
+	}
+	if got := len([]rune(result.BodyText)); got > maxEmailBodyRunes+len([]rune("\n[... truncated]")) {
+		t.Errorf("body not truncated: %d runes", got)
+	}
+}
+
+func TestHandleSearchEmails_IncludeBodyIsBounded(t *testing.T) {
+	database := openTestDB(t)
+	seedEntry(t, database, "acc1:INBOX:1", "acc1", "INBOX", "Newsletter", "news@example.com", 1)
+	body := "needle " + strings.Repeat("y", maxSearchBodyRunes*3)
+	if _, err := database.Exec(`INSERT INTO mail_content (entry_id, body_text) VALUES ('acc1:INBOX:1', ?)`, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO mail_content_fts (entry_id, subject, body_text) VALUES ('acc1:INBOX:1', 'Newsletter', ?)`, body); err != nil {
+		t.Fatal(err)
+	}
+	h := handleSearchEmails(database, &config.Config{})
+	out := callTool(t, h, map[string]any{"query": "needle", "include_body": true})
+
+	var page pagedResult[searchResult]
+	if err := json.Unmarshal([]byte(out), &page); err != nil {
+		t.Fatalf("JSON parse: %v\nraw: %s", err, out)
+	}
+	if len(page.Results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(page.Results))
+	}
+	if !page.Results[0].BodyTruncated {
+		t.Error("body_truncated should be true")
+	}
+	if !strings.HasSuffix(page.Results[0].BodyText, "[... truncated]") {
+		t.Error("body should carry the truncation marker")
+	}
+	if got := len([]rune(page.Results[0].BodyText)); got > maxSearchBodyRunes+len([]rune("\n[... truncated]")) {
+		t.Errorf("search body not truncated: %d runes", got)
+	}
+}
+
+func TestHandleSearchEmails_CJKFallbackIsBounded(t *testing.T) {
+	old := substringScanLimit
+	substringScanLimit = 2
+	t.Cleanup(func() { substringScanLimit = old })
+
+	database := openTestDB(t)
+	for i := 1; i <= 3; i++ {
+		id := fmt.Sprintf("acc1:INBOX:%d", i)
+		seedEntry(t, database, id, "acc1", "INBOX", fmt.Sprintf("通知 %d", i), "hr@example.com", i)
+	}
+	h := handleSearchEmails(database, &config.Config{})
+	out := callTool(t, h, map[string]any{"query": "通知"})
+
+	var page pagedResult[searchResult]
+	if err := json.Unmarshal([]byte(out), &page); err != nil {
+		t.Fatalf("JSON parse: %v\nraw: %s", err, out)
+	}
+	if len(page.Results) != 2 {
+		t.Errorf("expected the bounded window to return 2 results, got %d", len(page.Results))
+	}
+	if !page.ScanLimited || page.ScanLimit != 2 {
+		t.Errorf("expected scan_limited=true scan_limit=2, got %+v", page)
+	}
+}
+
+func TestHandleSearchEmails_MultipleTermsAreAND(t *testing.T) {
+	database := openTestDB(t)
+	seedEntry(t, database, "acc1:INBOX:1", "acc1", "INBOX", "April invoice", "billing@example.com", 1)
+	seedEntry(t, database, "acc1:INBOX:2", "acc1", "INBOX", "March invoice", "billing@example.com", 2)
+	if _, err := database.Exec(`INSERT INTO mail_content_fts (entry_id, subject, body_text) VALUES
+		('acc1:INBOX:1','April invoice','please pay the invoice this April'),
+		('acc1:INBOX:2','March invoice','please pay the invoice')`); err != nil {
+		t.Fatal(err)
+	}
+	h := handleSearchEmails(database, &config.Config{})
+
+	out := callTool(t, h, map[string]any{"query": "invoice April"})
+	var page pagedResult[searchResult]
+	if err := json.Unmarshal([]byte(out), &page); err != nil {
+		t.Fatalf("JSON parse: %v\nraw: %s", err, out)
+	}
+	if len(page.Results) != 1 || page.Results[0].ID != "acc1:INBOX:1" {
+		t.Errorf("expected only the April invoice, got %+v", page.Results)
+	}
+}
+
+func TestHandleSearchEmails_CJKIndex(t *testing.T) {
+	database := openTestDB(t)
+	const subject = "关于2026年度财务结算有关事项的通知"
+	const body = "请各部门于月底前完成结算工作"
+	seedEntry(t, database, "acc1:INBOX:1", "acc1", "INBOX", subject, "finance@example.com", 1)
+	seedEntry(t, database, "acc1:INBOX:2", "acc1", "INBOX", "Weekly report", "boss@example.com", 2)
+	if _, err := database.Exec(`INSERT INTO mail_content (entry_id, body_text, cjk_indexed) VALUES (?, ?, 1)`,
+		"acc1:INBOX:1", body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO mail_cjk_fts (entry_id, text) VALUES (?, ?)`,
+		"acc1:INBOX:1", db.CJKIndexText(subject+"\n"+body)); err != nil {
+		t.Fatal(err)
+	}
+	h := handleSearchEmails(database, &config.Config{})
+
+	for _, query := range []string{"通知", "财务结算", "2026 财务"} {
+		out := callTool(t, h, map[string]any{"query": query})
+		var page pagedResult[searchResult]
+		if err := json.Unmarshal([]byte(out), &page); err != nil {
+			t.Fatalf("JSON parse for %q: %v\nraw: %s", query, err, out)
+		}
+		if len(page.Results) != 1 || page.Results[0].ID != "acc1:INBOX:1" {
+			t.Errorf("query %q: expected the CJK hit, got %+v", query, page.Results)
+		}
+		if page.ScanLimited {
+			t.Errorf("query %q: CJK index result must not use the bounded LIKE fallback", query)
+		}
 	}
 }

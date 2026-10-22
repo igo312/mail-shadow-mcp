@@ -15,6 +15,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/server"
@@ -47,7 +49,7 @@ func startMCPServer(mcpSrv *server.MCPServer, cfg *config.Config) error {
 	case "http":
 		slog.Info("MCP transport: StreamableHTTP", "addr", addr, "auth", cfg.HTTPBearerToken != "")
 		handler := withBearer(cfg.HTTPBearerToken, server.NewStreamableHTTPServer(mcpSrv))
-		return http.ListenAndServe(addr, handler)
+		return serveHTTP(addr, handler)
 	case "sse":
 		baseURL := cfg.HTTPBaseURL
 		if baseURL == "" {
@@ -55,10 +57,27 @@ func startMCPServer(mcpSrv *server.MCPServer, cfg *config.Config) error {
 		}
 		slog.Info("MCP transport: SSE", "addr", addr, "base_url", baseURL, "auth", cfg.HTTPBearerToken != "")
 		handler := withBearer(cfg.HTTPBearerToken, server.NewSSEServer(mcpSrv, server.WithBaseURL(baseURL)))
-		return http.ListenAndServe(addr, handler)
+		return serveHTTP(addr, handler)
 	default:
 		return fmt.Errorf("unknown transport %q — valid values: stdio, http, sse", cfg.Transport)
 	}
+}
+
+// serveHTTP starts the MCP HTTP transport with defensive timeouts.
+//
+// WriteTimeout is deliberately not set: StreamableHTTP/SSE responses can stay
+// open for as long as the agent keeps the session.  ReadHeaderTimeout and
+// IdleTimeout still bound slow/idle clients, and the handler's own read limits
+// bound request bodies.
+func serveHTTP(addr string, handler http.Handler) error {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+	}
+	return srv.ListenAndServe()
 }
 
 // withBearer wraps an http.Handler with Bearer token authentication.
@@ -67,9 +86,14 @@ func withBearer(token string, next http.Handler) http.Handler {
 	if token == "" {
 		return next
 	}
-	expected := "Bearer " + token
+	const prefix = "Bearer "
+	expected := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != expected {
+		auth := r.Header.Get("Authorization")
+		ok := len(auth) >= len(prefix) &&
+			strings.EqualFold(auth[:len(prefix)], prefix) &&
+			subtle.ConstantTimeCompare([]byte(auth[len(prefix):]), expected) == 1
+		if !ok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="mail-shadow-mcp"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -137,7 +161,12 @@ func cmdServe(args []string) {
 			}
 		}
 	}
-	go runSync()
+	go func() {
+		// A brand-new instance (no synced UID yet) fetches its mail
+		// immediately; only a restart with existing data is jittered.
+		time.Sleep(imapsync.InitialDelay(database, cfg, syncInterval))
+		runSync()
+	}()
 	go func() {
 		ticker := time.NewTicker(syncInterval)
 		defer ticker.Stop()
@@ -163,6 +192,18 @@ func openDatabase(cfg *config.Config) *sql.DB {
 	dbPath := cfg.Database.Path
 	if dbPath == "" {
 		dbPath = "data/mail.db"
+	}
+	// SQLite temp b-tree pages and FTS merge spills must not go to the
+	// container's 16 MB /tmp tmpfs: writes there count against the container
+	// memory limit.  Put them on the /data volume instead.
+	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
+		tmpDir := filepath.Join(filepath.Dir(dbPath), "tmp")
+		if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+			slog.Warn("could not create sqlite temp dir", "dir", tmpDir, "err", err)
+		} else {
+			os.Setenv("SQLITE_TMPDIR", tmpDir)
+			os.Setenv("TMPDIR", tmpDir)
+		}
 	}
 	database, err := db.Open(dbPath)
 	if err != nil {

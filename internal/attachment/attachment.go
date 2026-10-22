@@ -45,7 +45,14 @@ type partInfo struct {
 	filename    string
 	contentType string
 	encoding    string // "base64", "quoted-printable", "7bit", etc.
+	size        int64  // declared size from BODYSTRUCTURE (0 = unknown)
 }
+
+// maxAttachmentBytes caps a single attachment fetched into memory.  The
+// download path buffers the encoded part and then the decoded copy; on the
+// 128 MB / 4 GB-host profile a 16 MB cap leaves room for Go's heap, SQLite and
+// the rest of the process.  Larger files are reported as skipped instead.
+const maxAttachmentBytes = 16 << 20
 
 // DownloadForEmail connects to IMAP, fetches all attachment parts of the
 // given message, and saves them under baseDir/<sanitized_email_id>/.
@@ -124,6 +131,11 @@ func prepareIMAPForEmail(acc config.AccountConfig, folder string, uid uint32) (*
 // saveAttachmentPart fetches, decodes, and writes one attachment part to disk.
 // Returns nil if the part could not be saved.
 func saveAttachmentPart(c *imapclient.Client, uidSet imap.UIDSet, p partInfo, uid uint32, outDir string) *DownloadedFile {
+	if p.size > maxAttachmentBytes {
+		slog.Warn("attachment: skipped because it exceeds the in-memory limit",
+			"uid", uid, "path", p.path, "bytes", p.size, "limit", maxAttachmentBytes)
+		return nil
+	}
 	raw, err := fetchPart(c, uidSet, p.path)
 	if err != nil {
 		slog.Warn("attachment: could not fetch part", "uid", uid, "path", p.path, "err", err)
@@ -202,6 +214,7 @@ func walkParts(bs imap.BodyStructure, path []int, out *[]partInfo) {
 				filename:    part.Filename(),
 				contentType: part.MediaType(),
 				encoding:    strings.ToLower(part.Encoding),
+				size:        int64(part.Size),
 			})
 		}
 	case *imap.BodyStructureMultiPart:

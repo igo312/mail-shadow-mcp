@@ -10,7 +10,9 @@ package db
 
 import (
 	"database/sql"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 // openTestDB opens an in-memory SQLite database and runs Migrate().
@@ -152,5 +154,118 @@ func TestMigrate_ForeignKeyEnforced(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO mail_attachments (entry_id, filename) VALUES ('nonexistent', 'file.pdf')`)
 	if err == nil {
 		t.Error("expected foreign key violation, got nil")
+	}
+}
+
+func TestOpenFileUsesConcurrentReadPool(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "mail.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer database.Close()
+	if err := Migrate(database); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if got := database.Stats().MaxOpenConnections; got < 2 {
+		t.Fatalf("MaxOpenConnections = %d, want a reader pool", got)
+	}
+
+	if _, err := database.Exec(`INSERT INTO mail_entries
+		(id, account_id, imap_uid, imap_folder, subject, sender)
+		VALUES ('e1','a',1,'INBOX','one','x@y.z')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold a write transaction and verify a reader on another connection is
+	// not blocked by it (WAL snapshot).
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO mail_entries
+		(id, account_id, imap_uid, imap_folder, subject, sender)
+		VALUES ('e2','a',2,'INBOX','two','x@y.z')`); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		var n int
+		err := database.QueryRow(`SELECT COUNT(*) FROM mail_entries`).Scan(&n)
+		done <- result{n, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			tx.Rollback()
+			t.Fatalf("concurrent read: %v", got.err)
+		}
+		if got.n != 1 {
+			tx.Rollback()
+			t.Fatalf("reader saw %d rows, want the pre-commit snapshot of 1", got.n)
+		}
+	case <-time.After(3 * time.Second):
+		tx.Rollback()
+		t.Fatal("reader was blocked by the open write transaction")
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM mail_entries`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("after commit: got %d rows, want 2", n)
+	}
+}
+
+func TestOpenFilePathWithSpace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mail shadow.db")
+	database, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer database.Close()
+	if err := Migrate(database); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO mail_entries
+		(id, account_id, imap_uid, imap_folder, subject, sender)
+		VALUES ('e1','a',1,'INBOX','one','x@y.z')`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCJKIndexPending(t *testing.T) {
+	database := openTestDB(t)
+
+	// No folders synced yet: nothing can be missing from the index.
+	if CJKIndexPending(database) {
+		t.Fatal("empty sync_state should not be pending")
+	}
+
+	if _, err := database.Exec(`INSERT INTO sync_state
+		(account_id, imap_folder, last_uid, cjk_backfill_done)
+		VALUES ('acct', 'INBOX', 7, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	if !CJKIndexPending(database) {
+		t.Fatal("a folder with cjk_backfill_done=0 must be pending")
+	}
+
+	if _, err := database.Exec(
+		`UPDATE sync_state SET cjk_backfill_done = 1`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if CJKIndexPending(database) {
+		t.Fatal("a fully backfilled folder must not be pending")
 	}
 }

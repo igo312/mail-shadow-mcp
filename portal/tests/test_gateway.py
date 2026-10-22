@@ -75,9 +75,68 @@ class BackendHandler(BaseHTTPRequestHandler):
         pass
 
 
+class OtherBackendHandler(BaseHTTPRequestHandler):
+    """Stands in for another user's container listening on a reused port."""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):  # noqa: N802
+        body = b'{"backend":"other-user"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        body = b'{"backend":"other-user"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
 class FakeDocker:
+    def __init__(self) -> None:
+        self.containers: dict[str, dict] = {}
+
+    def inspect_container(self, name):
+        return self.containers.get(name)
+
     def container_ip(self, name, network):
-        return "127.0.0.1"
+        info = self.containers.get(name) or {}
+        networks = (info.get("NetworkSettings") or {}).get("Networks") or {}
+        entry = networks.get(network) or {}
+        return entry.get("IPAddress")
+
+    def add_container(
+        self,
+        name: str,
+        *,
+        instance_id: str,
+        ip: str = "127.0.0.1",
+        host_port: int = 0,
+        running: bool = True,
+        label: str | None = None,
+    ) -> None:
+        ports = {}
+        if host_port:
+            ports["8080/tcp"] = [{"HostIp": "127.0.0.1", "HostPort": str(host_port)}]
+        self.containers[name] = {
+            "Id": "cid-" + name,
+            "State": {"Running": running, "Status": "running" if running else "exited"},
+            "Config": {"Labels": {"msm.instance": label if label is not None else instance_id}},
+            "NetworkSettings": {
+                "Networks": {"msm-net": {"IPAddress": ip}},
+                "Ports": ports,
+            },
+        }
 
 
 class DummyProvisioner:
@@ -92,6 +151,13 @@ class GatewayTest(unittest.TestCase):
         self.backend_thread = threading.Thread(target=self.backend.serve_forever, daemon=True)
         self.backend_thread.start()
         backend_port = self.backend.server_address[1]
+
+        # A second, unrelated MCP container.  Its host port is exactly the
+        # stale value that used to be stored in the control database.
+        self.other_backend = ThreadingHTTPServer(("127.0.0.1", 0), OtherBackendHandler)
+        self.other_thread = threading.Thread(target=self.other_backend.serve_forever, daemon=True)
+        self.other_thread.start()
+        self.other_port = self.other_backend.server_address[1]
 
         self.tmp = tempfile.TemporaryDirectory()
         self.env_patch = mock.patch.dict(
@@ -135,7 +201,14 @@ class GatewayTest(unittest.TestCase):
             }
         )
         limiter = RateLimiter()
-        gateway = Gateway(self.config, self.db, FakeDocker(), self.tokens, limiter)
+        self.docker = FakeDocker()
+        self.docker.add_container(
+            "msm-bbbbbbbbbbbbbbbb",
+            instance_id="b" * 16,
+            ip="127.0.0.1",
+            host_port=backend_port,
+        )
+        gateway = Gateway(self.config, self.db, self.docker, self.tokens, limiter)
         self.web = WebApp(
             self.config,
             self.db,
@@ -156,6 +229,9 @@ class GatewayTest(unittest.TestCase):
         self.backend.shutdown()
         self.backend.server_close()
         self.backend_thread.join(timeout=3)
+        self.other_backend.shutdown()
+        self.other_backend.server_close()
+        self.other_thread.join(timeout=3)
         self.db.close()
         self.env_patch.stop()
         self.tmp.cleanup()
@@ -236,14 +312,90 @@ class GatewayTest(unittest.TestCase):
         connection.close()
         self.assertIsNone(BackendHandler.seen[-1]["cookie"])
 
-    def test_port_mode_target_uses_loopback_host_port(self) -> None:
-        config = replace(self.config, backend_mode="port")
-        gateway = Gateway(config, self.db, FakeDocker(), self.tokens, RateLimiter())
-        instance = dict(self.db.get_instance("b" * 16))
-        instance["host_port"] = 43210
-        self.assertEqual(gateway._backend_target(instance), ("127.0.0.1", 43210))  # noqa: SLF001
-        instance["host_port"] = 0
-        self.assertIsNone(gateway._backend_target(instance))  # noqa: SLF001
+    def _start_portal_with(self, config, docker) -> int:
+        gateway = Gateway(config, self.db, docker, self.tokens, RateLimiter())
+        web = WebApp(
+            config,
+            self.db,
+            self.tokens,
+            DummyProvisioner(),
+            gateway,
+            RateLimiter(),
+        )
+        server = web.create_server()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close(), thread.join(timeout=3)))
+        return server.server_address[1]
+
+    def test_port_mode_ignores_stale_db_port_and_uses_live_container(self) -> None:
+        # The database still points at the old port, which Docker has since
+        # assigned to another user's container.  Routing must follow the live
+        # container, not the stale row.
+        self.db.set_instance_host_port("b" * 16, self.other_port)
+        config = replace(self.config, backend_mode="port", backend_port=8080)
+        portal_port = self._start_portal_with(config, self.docker)
+
+        status, data = self._request_on(portal_port, "GET", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(data, b'{"backend":"ok"}')
+        # The informative DB column is repaired as a side effect.
+        self.assertEqual(
+            self.db.get_instance("b" * 16)["host_port"],
+            self.backend.server_address[1],
+        )
+
+    def test_port_mode_refuses_missing_container(self) -> None:
+        self.db.set_instance_host_port("b" * 16, self.other_port)
+        config = replace(self.config, backend_mode="port", backend_port=8080)
+        self.docker.containers.pop("msm-bbbbbbbbbbbbbbbb", None)
+        status, data = self._request_on(
+            self._start_portal_with(config, self.docker), "GET", token=self.token
+        )
+        self.assertEqual(status, 502)
+        self.assertNotIn(b"other-user", data)
+
+    def test_port_mode_refuses_stopped_container(self) -> None:
+        self.db.set_instance_host_port("b" * 16, self.other_port)
+        config = replace(self.config, backend_mode="port", backend_port=8080)
+        self.docker.add_container(
+            "msm-bbbbbbbbbbbbbbbb",
+            instance_id="b" * 16,
+            host_port=self.backend.server_address[1],
+            running=False,
+        )
+        status, data = self._request_on(
+            self._start_portal_with(config, self.docker), "GET", token=self.token
+        )
+        self.assertEqual(status, 502)
+        self.assertNotIn(b"other-user", data)
+
+    def test_port_mode_refuses_container_with_foreign_label(self) -> None:
+        self.db.set_instance_host_port("b" * 16, self.other_port)
+        config = replace(self.config, backend_mode="port", backend_port=8080)
+        self.docker.add_container(
+            "msm-bbbbbbbbbbbbbbbb",
+            instance_id="b" * 16,
+            host_port=self.backend.server_address[1],
+            label="c" * 16,
+        )
+        status, data = self._request_on(
+            self._start_portal_with(config, self.docker), "GET", token=self.token
+        )
+        self.assertEqual(status, 502)
+        self.assertNotIn(b"other-user", data)
+
+    def _request_on(self, port: int, method: str, *, token: str | None = None):
+        headers = {}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        connection.request(method, "/mcp", headers=headers)
+        response = connection.getresponse()
+        data = response.read()
+        status = response.status
+        connection.close()
+        return status, data
 
     def test_sse_is_streamed_without_waiting_for_eof(self) -> None:
         BackendHandler.streaming = True
