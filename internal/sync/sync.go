@@ -878,8 +878,13 @@ func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) err
 	const (
 		// The query materialises body_text for each row.  Keep the batch small:
 		// 25 × the 256 KB body cap is ~6 MB, safe inside a 128 MB container.
+		// The per-sync cap controls how many rows one folder can backfill per
+		// sync pass, not peak memory (the batches are still 25 rows).  A large
+		// legacy mailbox would otherwise need hundreds of 5-minute passes:
+		// 20k keeps a 450k-message folder to ~23 passes instead of ~230, while
+		// still yielding between batches.
 		batchSize  = 25
-		maxPerSync = 2000
+		maxPerSync = 20000
 	)
 	total := 0
 	for total < maxPerSync {
