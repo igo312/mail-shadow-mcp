@@ -186,6 +186,61 @@ class TokenService:
             raise CookieError("expired")
         return data
 
+    # -- admin console ---------------------------------------------------
+    def make_admin(self, ttl_seconds: int) -> str:
+        """Signed cookie proving a successful admin password check.
+
+        The cookie carries no secret: it is an HMAC over a nonce, a role and an
+        expiry, so it cannot be forged without the master key and cannot be
+        replayed after ``ttl_seconds``.
+        """
+        now = int(time.time())
+        return self._encode_cookie(
+            {
+                "v": 1,
+                "kind": "admin",
+                "role": "admin",
+                "nonce": secrets.token_hex(8),
+                "iat": now,
+                "exp": now + ttl_seconds,
+            }
+        )
+
+    def parse_admin(self, cookie: str) -> dict[str, Any]:
+        data = self._decode_cookie(cookie)
+        if data.get("kind") != "admin" or data.get("role") != "admin":
+            raise CookieError("not an admin session")
+        if int(data.get("exp", 0)) <= int(time.time()):
+            raise CookieError("expired")
+        return data
+
+    def make_admin_flash(self, values: dict[str, Any], ttl_seconds: int = 300) -> str:
+        """One-shot payload (e.g. a freshly created invite code) for /admin."""
+        now = int(time.time())
+        return self._encode_cookie(
+            {
+                "v": 1,
+                "kind": "admin_flash",
+                "values": {
+                    str(key): (value if isinstance(value, (int, bool)) else str(value))[:400]
+                    for key, value in values.items()
+                },
+                "iat": now,
+                "exp": now + ttl_seconds,
+            }
+        )
+
+    def parse_admin_flash(self, cookie: str) -> dict[str, Any]:
+        data = self._decode_cookie(cookie)
+        if data.get("kind") != "admin_flash":
+            raise CookieError("not an admin flash")
+        if int(data.get("exp", 0)) <= int(time.time()):
+            raise CookieError("expired")
+        values = data.get("values")
+        if not isinstance(values, dict):
+            raise CookieError("malformed admin flash")
+        return values
+
 
 @dataclass(frozen=True)
 class RateDecision:

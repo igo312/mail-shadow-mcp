@@ -531,8 +531,35 @@ docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}'
 | `MSM_ALLOW_PRIVATE_IMAP` | `0` | 是否允许自定义 IMAP 指向内网/回环地址；公网部署保持 0 |
 | `MSM_ALLOW_ANY_IMAP_PORT` | `0` | 是否允许 993/143 之外的 IMAP 端口；公网部署保持 0 |
 | `MSM_TRUST_PROXY` | `0` | 是否信任 `X-Forwarded-For`；只有前面有可信反向代理时才设为 1 |
+| `MSM_ADMIN_PASSWORD` | 空（禁用） | 管理控制台 `/admin` 的密码，至少 8 位。为空时 `/admin` 直接返回 404。**只应通过 HTTPS 访问**；登录表单会把密码发给服务端 |
+| `MSM_ADMIN_SESSION_TTL` | `28800` | 管理会话有效期（秒），到期后需重新登录 |
+| `MSM_ADMIN_RATE_LIMIT` / `_WINDOW` | `8` / `900` | 每 IP 管理登录尝试限制 |
+| `MSM_DOCKER_VOLUME_ROOT` | `/var/lib/docker/volumes` | Docker 的命名卷目录。路径不存在时自动改用 `docker info` 里的 `DockerRootDir`，通常不用设 |
+| `MSM_STATS_INTERVAL` | `300` | 控制台采集各实例影子库统计的间隔（秒） |
 | `MSM_BOOTSTRAP_INVITE` | 空 | 启动时创建一次性引导邀请码 |
 | `MSM_LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARN` / `ERROR` |
+
+---
+
+## 管理控制台 `/admin`
+
+设置 `MSM_ADMIN_PASSWORD` 后，用浏览器打开 `/admin`，输入密码即可进入。控制台只做**只读统计 + 容器级操作**：
+
+- **概览**：邮箱总数（运行 / 暂停 / 异常）、同步文件夹总数、邮件总数、影子数据总量、近 24 小时新增、主机负载 / 内存 / 磁盘剩余。
+- **邮箱列表**：每个邮箱同步了几个文件夹（并列出文件夹名）、多少封邮件、占用多少空间、最新邮件时间、待拉取 UID 差，以及一键「停止 / 启动」。
+- **实例详情**：每个文件夹的邮件数、最新 UID、已同步 UID、待拉取、CJK 索引状态；CPU / 内存 / 网络；容器日志最后 80 行；启动 / 停止 / 重启 / 删除（删除需输入邮箱地址确认）。
+- **邀请码**：查看已用 / 上限、到期时间、关联邮箱数；在线生成（明文只显示一次）与停用。
+- **审计日志**：最近 200 条邀请、开通、登录、管理操作与异常。
+
+数据来源：控制数据库（邮箱、状态、文件夹选择）+ 各实例数据卷里的影子 SQLite（`<volume>/_data/mail.db`）。
+
+- 影子库以 **只读**（`mode=ro`）方式打开，WAL 模式下不会阻塞实例同步；
+- 每条查询都有 5 秒的墙钟预算，超大邮箱也不会拖住页面；
+- 采集在后台线程按 `MSM_STATS_INTERVAL`（默认 300 秒）顺序执行，页面始终渲染上一次快照，并可随时点「重新采集」。
+
+「待拉取」= 文件夹最新 UID − 已同步 UID，只是判断同步是否落后的近似值：删除邮件、UIDVALIDITY 变化也会让它不为零。
+
+> ⚠️ 这个 portal 默认监听明文 HTTP。管理密码通过登录表单提交，**在没有 TLS 的地址上使用等于把密码暴露在网络上**。生产环境请在前面加一层 HTTPS（Caddy/Nginx），或至少只在内网/VPN 里访问 `/admin`。
 
 ---
 

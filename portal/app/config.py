@@ -127,6 +127,18 @@ class Config:
     gateway_rate_window: int = 60
     gateway_timeout_seconds: int = 120
 
+    # Admin console (/admin).  An empty password disables the whole console:
+    # there is no default credential, and a missing MSM_ADMIN_PASSWORD must
+    # never fall back to a well-known one.
+    admin_password: str = field(default="", repr=False)
+    admin_session_ttl_seconds: int = 28800
+    admin_rate_limit: int = 8
+    admin_rate_window: int = 900
+    # Where the Docker daemon keeps named volumes; the console reads each
+    # instance's shadow database from there (read-only).
+    docker_volume_root: str = "/var/lib/docker/volumes"
+    stats_interval_seconds: int = 300
+
     bootstrap_invite: str = field(default="", repr=False)
     bootstrap_invite_uses: int = 1
     bootstrap_invite_days: int = 7
@@ -163,6 +175,10 @@ class Config:
             master_key = _load_master_key(data_dir)
         except OSError as exc:
             raise ConfigError(f"cannot prepare master key in {data_dir}: {exc}") from exc
+
+        admin_password = os.environ.get("MSM_ADMIN_PASSWORD", "").strip()
+        if admin_password and len(admin_password) < 8:
+            raise ConfigError("MSM_ADMIN_PASSWORD must be at least 8 characters")
 
         return cls(
             data_dir=data_dir,
@@ -205,6 +221,12 @@ class Config:
             gateway_rate_limit=_env_int("MSM_GATEWAY_RATE_LIMIT", 120, 1),
             gateway_rate_window=_env_int("MSM_GATEWAY_RATE_WINDOW", 60, 1),
             gateway_timeout_seconds=_env_int("MSM_GATEWAY_TIMEOUT", 120, 5),
+            admin_password=admin_password,
+            admin_session_ttl_seconds=_env_int("MSM_ADMIN_SESSION_TTL", 28800, 300),
+            admin_rate_limit=_env_int("MSM_ADMIN_RATE_LIMIT", 8, 1),
+            admin_rate_window=_env_int("MSM_ADMIN_RATE_WINDOW", 900, 1),
+            docker_volume_root=_env("MSM_DOCKER_VOLUME_ROOT", "/var/lib/docker/volumes"),
+            stats_interval_seconds=_env_int("MSM_STATS_INTERVAL", 300, 30),
             bootstrap_invite=os.environ.get("MSM_BOOTSTRAP_INVITE", "").strip(),
             bootstrap_invite_uses=_env_int("MSM_BOOTSTRAP_INVITE_USES", 1, 1),
             bootstrap_invite_days=_env_int("MSM_BOOTSTRAP_INVITE_DAYS", 7, 1),

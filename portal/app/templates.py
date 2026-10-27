@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import html
 import json
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 from .providers import PROVIDERS
+from .stats import human_bytes, human_count
 
 
 def e(value: Any) -> str:
@@ -32,6 +35,7 @@ def layout(
     show_logout: bool = False,
     csrf: str = "",
     wide: bool = False,
+    nav: str = "",
 ) -> str:
     logout = ""
     if show_logout:
@@ -60,6 +64,7 @@ def layout(
     {logout}
   </header>
   <main class="shell{' shell-wide' if wide else ''}">
+    {nav}
     {body}
   </main>
   <footer class="footer{' footer-wide' if wide else ''}">
@@ -331,6 +336,7 @@ def result_page(
         "running": "容器运行中",
         "provisioning": "容器创建中",
         "updating": "容器更新中",
+        "stopped": "已暂停",
         "failed": "需要重试",
         "removed": "已移除",
     }
@@ -393,6 +399,7 @@ def instance_status_page(
         "running": "运行中",
         "provisioning": "创建中",
         "updating": "更新中",
+        "stopped": "已暂停",
         "failed": "需要重试",
         "removed": "已移除",
     }
@@ -460,6 +467,607 @@ def error_page(
       </div>
     </section>"""
     return layout(title, body, show_logout=show_logout, csrf=csrf)
+
+
+# ---------------------------------------------------------------------------
+# admin console
+# ---------------------------------------------------------------------------
+_ADMIN_TABS = (
+    ("overview", "概览", "/admin"),
+    ("invites", "邀请码", "/admin/invites"),
+    ("audit", "审计日志", "/admin/audit"),
+)
+
+
+def _admin_nav(active: str, csrf: str) -> str:
+    links = "".join(
+        f'<a class="admin-tab{" active" if key == active else ""}" href="{href}">{label}</a>'
+        for key, label, href in _ADMIN_TABS
+    )
+    return f"""
+    <nav class="admin-nav">
+      <div class="admin-tabs">{links}</div>
+      <div class="admin-nav-actions">
+        <form method="post" action="/admin/refresh" class="inline-form">
+          <input type="hidden" name="csrf" value="{e(csrf)}">
+          <button class="btn btn-ghost btn-small" type="submit">重新采集</button>
+        </form>
+        <form method="post" action="/admin/logout" class="inline-form">
+          <input type="hidden" name="csrf" value="{e(csrf)}">
+          <button class="btn btn-ghost btn-small" type="submit">退出管理</button>
+        </form>
+      </div>
+    </nav>"""
+
+
+def _admin_message(message: str, kind: str = "ok") -> str:
+    if not message:
+        return ""
+    kind = kind if kind in {"ok", "warn", "error", "info"} else "info"
+    title = {"ok": "完成", "warn": "注意", "error": "失败", "info": "提示"}[kind]
+    return f'<div class="callout callout-{kind}"><strong>{title}</strong><p>{e(message)}</p></div>'
+
+
+def admin_login_page(*, error: str = "") -> str:
+    error_html = f'<div class="form-error" role="alert">{e(error)}</div>' if error else ""
+    body = f"""
+    <section class="page-head">
+      <div class="eyebrow"><span class="pulse"></span> 运营控制台</div>
+      <h1>管理登录</h1>
+      <p>查看邮箱数量、同步文件夹与数据量，并启动 / 停止实例。</p>
+    </section>
+    <section class="card card-narrow">
+      {error_html}
+      <form method="post" action="/admin/login" class="stack" autocomplete="off">
+        <label class="field">
+          <span class="label">管理密码</span>
+          <input class="input" type="password" name="password" required autofocus
+                 autocomplete="current-password" spellcheck="false">
+        </label>
+        <button class="btn btn-primary" type="submit">进入控制台</button>
+      </form>
+      <p class="fineprint">连续输错会按来源 IP 限速并记入审计日志；管理会话到期后需要重新登录。</p>
+    </section>"""
+    return layout("管理登录", body)
+
+
+def admin_dashboard(
+    *,
+    snapshot: dict[str, Any],
+    csrf: str,
+    message: str = "",
+    message_kind: str = "ok",
+    stats_interval: int = 300,
+) -> str:
+    entries = sorted(
+        (snapshot.get("instances") or {}).values(),
+        key=lambda item: str(item.get("email") or ""),
+    )
+    total = len(entries)
+    running = sum(1 for item in entries if _badge(item)[0] == "running")
+    paused = sum(1 for item in entries if str(item.get("status")) == "stopped")
+    broken = total - running - paused
+    folder_total = sum(int(item.get("folder_count") or 0) for item in entries)
+    messages = sum(int(item.get("messages") or 0) for item in entries)
+    total_bytes = sum(int(item.get("total_bytes") or 0) for item in entries)
+    growth_messages = 0
+    growth_bytes = 0
+    for item in entries:
+        growth = item.get("growth") or {}
+        growth_messages += int(growth.get("messages") or 0)
+        growth_bytes += int(growth.get("bytes") or 0)
+    pending_total = sum(int(item.get("pending") or 0) for item in entries)
+    host = snapshot.get("host") or {}
+    generated = int(snapshot.get("generated_at") or 0)
+
+    rows = "".join(_admin_row(item, csrf) for item in entries)
+    if not rows:
+        rows = '<tr><td colspan="8" class="empty">还没有任何邮箱实例。</td></tr>'
+
+    disk = human_bytes(host.get("disk_free")) if host.get("disk_free") else "—"
+    memory = "—"
+    if host.get("mem_total"):
+        used = int(host["mem_total"]) - int(host.get("mem_available") or 0)
+        memory = f"{human_bytes(used)} / {human_bytes(host['mem_total'])}"
+    load = "—" if host.get("load1") is None else f"{host['load1']:.2f}"
+    cpu_count = host.get("cpu_count") or 0
+    collected = f"{_ago(generated)}（每 {int(stats_interval)} 秒自动采集）" if generated else "首次采集进行中…"
+
+    body = f"""
+    <section class="page-head">
+      <h1>控制台</h1>
+      <p>采集于 {e(collected)} · 数据来自各实例那本只读的影子数据库</p>
+    </section>
+    {_admin_message(message, message_kind)}
+    {_admin_message(str(snapshot.get("error") or ""), "warn")}
+    <div class="kpi-grid">
+      <div class="kpi"><span>邮箱</span><strong>{total}</strong>
+        <small>{running} 运行中 · {paused} 已暂停 · {broken} 异常</small></div>
+      <div class="kpi"><span>影子库文件夹</span><strong>{folder_total}</strong>
+        <small>{'平均 %.1f 个 / 邮箱' % (folder_total / total) if total else '—'} · 含历史同步过的文件夹</small></div>
+      <div class="kpi"><span>邮件总数</span><strong>{human_count(messages)}</strong>
+        <small>待拉取 UID 差 {pending_total}</small></div>
+      <div class="kpi"><span>影子数据</span><strong>{human_bytes(total_bytes)}</strong>
+        <small>近 24h {human_count(growth_messages)} 封 / {human_bytes(growth_bytes)}</small></div>
+      <div class="kpi"><span>主机</span><strong>{e(load)}</strong>
+        <small>负载 / {cpu_count} 核 · 内存 {memory} · 磁盘剩余 {disk}</small></div>
+    </div>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>邮箱实例</h2>
+        <p>「待拉取」是各文件夹最新 UID 与已同步 UID 的差值，用来判断同步是否落后。</p>
+      </div>
+      <div class="table-wrap">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>邮箱</th>
+              <th>状态</th>
+              <th class="num">同步文件夹</th>
+              <th class="num">邮件</th>
+              <th class="num">占用</th>
+              <th>最新邮件</th>
+              <th class="num">待拉取</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+      <p class="fineprint">占用 = 影子数据库 + WAL + 附件目录。邮件数与文件夹数只统计已同步进影子库的内容。</p>
+    </section>
+
+    <section class="card card-muted">
+      <h3>这里能做什么</h3>
+      <ul class="ticks">
+        <li>查看每个邮箱同步了几个文件夹、同步了多少封邮件、占多少空间。</li>
+        <li>启动 / 停止 / 重启单个实例；删除实例需要输入邮箱地址确认。</li>
+        <li>发放和停用邀请码，查看最近的登录、开通、异常审计记录。</li>
+      </ul>
+    </section>"""
+    return layout("控制台", body, csrf=csrf, wide=True, nav=_admin_nav("overview", csrf))
+
+
+def admin_instance_page(
+    *,
+    instance: dict[str, Any],
+    entry: dict[str, Any],
+    csrf: str,
+    logs: str = "",
+    message: str = "",
+    message_kind: str = "ok",
+) -> str:
+    kind, label = _badge(entry)
+    configured = entry.get("configured") or {}
+    if configured.get("source") == "deployment":
+        scope = "部署默认（未单独选择）"
+    elif configured.get("all"):
+        scope = "全部文件夹"
+    else:
+        names = [str(name) for name in configured.get("names") or []]
+        scope = "、".join(names) if names else "部署默认"
+
+    folder_rows = "".join(
+        f"""<tr>
+              <td class="cell-main">{e(folder['name'])}</td>
+              <td class="num">{int(folder['messages']):,}</td>
+              <td class="num">{int(folder['newest_uid']):,}</td>
+              <td class="num">{int(folder['synced_uid']):,}</td>
+              <td class="num">{_pending_cell(int(folder['pending']))}</td>
+              <td>{'已完成' if folder['cjk_done'] else '<span class="warn-text">补全中</span>'}</td>
+            </tr>"""
+        for folder in entry.get("folders") or []
+    ) or '<tr><td colspan="6" class="empty">还没有同步任何文件夹。</td></tr>'
+
+    growth = entry.get("growth") or {}
+    growth_text = "—"
+    if growth.get("messages") is not None:
+        growth_text = f"+{human_count(growth['messages'])} 封 / +{human_bytes(growth['bytes'])}"
+    elif entry.get("growth") is not None:
+        growth_text = "历史还在积累"
+
+    read_error = ""
+    if not entry.get("ok"):
+        read_error = _admin_message(str(entry.get("error") or "影子数据读取失败"), "warn")
+    if entry.get("log_error"):
+        read_error += _admin_message(f"容器最近报错：{entry['log_error']}", "error")
+
+    state = str(entry.get("container_state") or "")
+    if state == "running":
+        power = """
+        <form method="post" action="/admin/action" class="inline-form">
+          <input type="hidden" name="csrf" value="{csrf}">
+          <input type="hidden" name="instance" value="{instance_id}">
+          <input type="hidden" name="action" value="stop">
+          <button class="btn btn-secondary btn-small" type="submit">停止实例</button>
+        </form>
+        <form method="post" action="/admin/action" class="inline-form">
+          <input type="hidden" name="csrf" value="{csrf}">
+          <input type="hidden" name="instance" value="{instance_id}">
+          <input type="hidden" name="action" value="restart">
+          <button class="btn btn-ghost btn-small" type="submit">重启容器</button>
+        </form>"""
+    else:
+        power = """
+        <form method="post" action="/admin/action" class="inline-form">
+          <input type="hidden" name="csrf" value="{csrf}">
+          <input type="hidden" name="instance" value="{instance_id}">
+          <input type="hidden" name="action" value="start">
+          <button class="btn btn-primary btn-small" type="submit">启动实例</button>
+        </form>
+        <form method="post" action="/admin/action" class="inline-form">
+          <input type="hidden" name="csrf" value="{csrf}">
+          <input type="hidden" name="instance" value="{instance_id}">
+          <input type="hidden" name="action" value="restart">
+          <button class="btn btn-ghost btn-small" type="submit">重启容器</button>
+        </form>"""
+    power = power.replace("{csrf}", e(csrf)).replace("{instance_id}", e(str(instance["id"])))
+
+    body = f"""
+    <section class="page-head">
+      <a class="back" href="/admin">← 控制台</a>
+      <h1>{e(instance['email'])}</h1>
+      <p>
+        <span class="status-badge status-{kind}"><span></span> {e(label)}</span>
+        <span class="badge-gap"></span>
+        {e(entry.get('provider_name') or 'IMAP')} · {e(instance.get('imap_host'))}:{e(instance.get('imap_port'))}
+        · 容器 <code>{e(instance.get('container_name'))}</code>
+      </p>
+    </section>
+    {_admin_message(message, message_kind)}
+    {read_error}
+    <div class="kpi-grid kpi-grid-3">
+      <div class="kpi"><span>邮件</span><strong>{human_count(entry.get('messages'))}</strong>
+        <small>最近 24h {e(growth_text)}</small></div>
+      <div class="kpi"><span>影子数据</span><strong>{human_bytes(entry.get('total_bytes'))}</strong>
+        <small>库 {human_bytes(entry.get('db_bytes'))} · WAL {human_bytes(entry.get('wal_bytes'))} · 附件 {human_bytes(entry.get('attachment_disk_bytes'))}</small></div>
+      <div class="kpi"><span>文件夹</span><strong>{int(entry.get('folder_count') or 0)}</strong>
+        <small>待拉取 {int(entry.get('pending') or 0)} · 隔离 {int(entry.get('skipped') or 0)}</small></div>
+    </div>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>同步文件夹明细</h2>
+        <p>配置范围：{e(scope)}。实际写入影子库的文件夹见下表。</p>
+      </div>
+      <div class="table-wrap">
+        <table class="data">
+          <thead><tr>
+            <th>文件夹</th><th class="num">邮件</th><th class="num">最新 UID</th>
+            <th class="num">已同步 UID</th><th class="num">待拉取</th><th>CJK 索引</th>
+          </tr></thead>
+          <tbody>{folder_rows}</tbody>
+        </table>
+      </div>
+      <p class="fineprint">「待拉取」= 最新 UID − 已同步 UID，仅供参考：删除邮件或 UIDVALIDITY 变化也会让它不为零。</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>运行状态</h2>
+        <p>{e(entry.get('container_status') or '容器状态未知')} · 镜像 <code>{e(entry.get('image') or '—')}</code></p>
+      </div>
+      <div class="kv-grid">
+        <div><span>CPU</span><strong>{float(entry.get('cpu_percent') or 0):.1f}%</strong></div>
+        <div><span>内存</span><strong>{human_bytes(entry.get('mem_bytes'))} / {human_bytes(entry.get('mem_limit'))}</strong></div>
+        <div><span>网络 收/发</span><strong>{human_bytes(entry.get('net_rx'))} / {human_bytes(entry.get('net_tx'))}</strong></div>
+        <div><span>最新邮件</span><strong>{_date(entry.get('newest_mail'))}</strong></div>
+        <div><span>最早邮件</span><strong>{_date(entry.get('oldest_mail'))}</strong></div>
+        <div><span>最近写入</span><strong>{_ago(entry.get('last_write_at'))}</strong></div>
+        <div><span>创建时间</span><strong>{_ts(instance.get('created_at'))}</strong></div>
+        <div><span>附件</span><strong>{int(entry.get('attachment_disk_files') or 0)} 个 · {human_bytes(entry.get('attachment_disk_bytes'))}</strong></div>
+      </div>
+      <div class="button-row">{power}</div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>容器日志</h2>
+        <p>最近 80 行，含同步与错误信息。</p>
+      </div>
+      <details class="advanced">
+        <summary>展开日志</summary>
+        <pre class="log">{e(logs or '（暂无日志）')}</pre>
+      </details>
+    </section>
+
+    <section class="card card-danger">
+      <div class="card-head">
+        <h2>删除实例</h2>
+        <p>删除容器和两个数据卷（影子库会被永久删除），并标记该邮箱为已移除。需要输入邮箱地址确认。</p>
+      </div>
+      <form method="post" action="/admin/action" class="stack">
+        <input type="hidden" name="csrf" value="{e(csrf)}">
+        <input type="hidden" name="instance" value="{e(str(instance['id']))}">
+        <input type="hidden" name="action" value="remove">
+        <label class="field">
+          <span class="label">输入 <code>{e(instance['email'])}</code> 以确认</span>
+          <input class="input" type="text" name="confirm" placeholder="{e(instance['email'])}"
+                 autocomplete="off" spellcheck="false" autocapitalize="none">
+        </label>
+        <button class="btn btn-danger btn-small" type="submit">永久删除</button>
+      </form>
+    </section>"""
+    return layout(
+        f"实例 · {instance['email']}",
+        body,
+        csrf=csrf,
+        wide=True,
+        nav=_admin_nav("overview", csrf),
+    )
+
+
+def admin_invites_page(
+    *,
+    invites: list[dict[str, Any]],
+    csrf: str,
+    new_code: str = "",
+    message: str = "",
+    message_kind: str = "ok",
+) -> str:
+    code_box = ""
+    if new_code:
+        code_box = f"""
+        <div class="callout callout-ok">
+          <strong>邀请码已创建，只显示这一次</strong>
+          <p>把这个码发给对方；关闭页面后无法再次查看，只能停用后重新生成。</p>
+          <div class="token-box">
+            <span class="mini-label">邀请码</span>
+            <code id="new-invite-code">{e(new_code)}</code>
+            <button class="btn btn-ghost btn-small copy-btn" type="button" data-copy="new-invite-code">复制</button>
+          </div>
+        </div>"""
+
+    rows = ""
+    for invite in invites:
+        expires = "永久" if not invite.get("expires_at") else _ts(invite["expires_at"])
+        disabled = bool(invite.get("disabled"))
+        left = max(0, int(invite["max_uses"]) - int(invite["uses"]))
+        status = (
+            '<span class="status-badge status-failed"><span></span> 已停用</span>'
+            if disabled
+            else (
+                '<span class="status-badge status-running"><span></span> 可用</span>'
+                if left > 0
+                else '<span class="status-badge status-removed"><span></span> 已用完</span>'
+            )
+        )
+        disable = ""
+        if not disabled:
+            disable = f"""
+            <form method="post" action="/admin/invites/disable" class="inline-form">
+              <input type="hidden" name="csrf" value="{e(csrf)}">
+              <input type="hidden" name="invite" value="{e(invite['id'])}">
+              <button class="btn btn-ghost btn-small" type="submit">停用</button>
+            </form>"""
+        rows += f"""<tr>
+          <td class="cell-main">{e(invite.get('label') or '（无标签）')}
+            <div class="cell-sub">{e(invite['id'])}</div></td>
+          <td class="num">{int(invite['uses'])} / {int(invite['max_uses'])}</td>
+          <td>{e(expires)}</td>
+          <td>{status}</td>
+          <td class="num">{int(invite.get('mailbox_count') or 0)}</td>
+          <td class="nowrap">{_ts(invite.get('last_used_at'))}</td>
+          <td class="row-actions">{disable}</td>
+        </tr>"""
+    if not rows:
+        rows = '<tr><td colspan="7" class="empty">还没有邀请码。</td></tr>'
+
+    body = f"""
+    <section class="page-head">
+      <h1>邀请码</h1>
+      <p>邀请码决定谁能开通邮箱实例；每个码有独立使用次数和有效期。</p>
+    </section>
+    {_admin_message(message, message_kind)}
+    {code_box}
+    <div class="grid-2 admin-grid">
+      <section class="card">
+        <div class="card-head">
+          <h2>现有邀请码</h2>
+          <p>「邮箱数」是使用该邀请码开通且仍存在的实例数量。</p>
+        </div>
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr>
+              <th>标签</th><th class="num">已用</th><th>到期</th><th>状态</th>
+              <th class="num">邮箱数</th><th>最近使用</th><th></th>
+            </tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>
+      </section>
+      <aside class="stack-aside">
+        <section class="card">
+          <div class="card-head">
+            <h2>创建邀请码</h2>
+            <p>生成后只显示一次，请立刻复制。</p>
+          </div>
+          <form method="post" action="/admin/invites/create" class="stack">
+            <input type="hidden" name="csrf" value="{e(csrf)}">
+            <label class="field">
+              <span class="label">备注标签</span>
+              <input class="input" type="text" name="label" maxlength="80"
+                     placeholder="例如：张伟 / 市场部" autocomplete="off">
+            </label>
+            <div class="field-row">
+              <label class="field">
+                <span class="label">可用次数</span>
+                <input class="input" type="number" name="uses" value="1" min="1" max="1000">
+              </label>
+              <label class="field">
+                <span class="label">有效天数</span>
+                <input class="input" type="number" name="days" value="30" min="0" max="3650">
+              </label>
+            </div>
+            <p class="help">有效天数填 0 表示永不过期。</p>
+            <button class="btn btn-primary" type="submit">生成邀请码</button>
+          </form>
+        </section>
+      </aside>
+    </div>"""
+    return layout("邀请码", body, csrf=csrf, wide=True, nav=_admin_nav("invites", csrf))
+
+
+def admin_audit_page(*, events: list[dict[str, Any]], csrf: str) -> str:
+    rows = ""
+    for event in events:
+        detail = str(event.get("detail") or "")
+        if len(detail) > 160:
+            detail = detail[:160] + "…"
+        rows += f"""<tr>
+          <td class="nowrap">{_ts(event['at'])}</td>
+          <td><code>{e(event['action'])}</code></td>
+          <td class="nowrap">{e(event.get('ip') or '')}</td>
+          <td class="cell-main">{e(event.get('email') or '')}</td>
+          <td class="cell-sub">{e(detail)}</td>
+        </tr>"""
+    if not rows:
+        rows = '<tr><td colspan="5" class="empty">还没有审计记录。</td></tr>'
+    body = f"""
+    <section class="page-head">
+      <h1>审计日志</h1>
+      <p>最近 200 条：邀请码、开通、登录、管理操作与异常。</p>
+    </section>
+    <section class="card">
+      <div class="table-wrap">
+        <table class="data">
+          <thead><tr><th>时间</th><th>动作</th><th>IP</th><th>邮箱</th><th>详情</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>"""
+    return layout("审计日志", body, csrf=csrf, wide=True, nav=_admin_nav("audit", csrf))
+
+
+def _badge(entry: dict[str, Any]) -> tuple[str, str]:
+    """Map an instance to (css suffix, label) using the *live* container state."""
+    status = str(entry.get("status") or "")
+    state = str(entry.get("container_state") or "")
+    if state == "running":
+        return "running", "运行中"
+    if status == "stopped":
+        return "stopped", "已暂停"
+    if status == "removed":
+        return "removed", "已移除"
+    if status in {"provisioning", "updating"}:
+        return status, {"provisioning": "创建中", "updating": "更新中"}[status]
+    if state == "missing" and status != "failed":
+        return "failed", "容器缺失"
+    if status == "failed":
+        return "failed", "需要重试"
+    return "failed", "已停止"
+
+
+def _admin_row(entry: dict[str, Any], csrf: str) -> str:
+    kind, label = _badge(entry)
+    instance_id = e(str(entry.get("id") or ""))
+    folder_count = int(entry.get("folder_count") or 0)
+    configured = entry.get("configured") or {}
+    if configured.get("source") == "deployment":
+        scope_main = "默认"
+        scope_names = "部署默认范围"
+        scope_count: int | None = None
+    elif configured.get("all"):
+        scope_main = "全部"
+        scope_names = ""
+        scope_count = None
+    else:
+        names = [str(name) for name in configured.get("names") or []]
+        scope_main = str(len(names))
+        scope_names = "、".join(names[:3]) + (" 等" if len(names) > 3 else "")
+        scope_count = len(names)
+    extra = ""
+    if scope_count is None or folder_count != scope_count:
+        extra = f'<div class="cell-sub">影子库 {folder_count} 个</div>'
+    error = ""
+    if not entry.get("ok"):
+        error = f'<div class="cell-sub cell-error">{e(entry.get("error") or "读取失败")}</div>'
+    if entry.get("log_error"):
+        error += f'<div class="cell-sub cell-error">日志错误：{e(entry["log_error"])}</div>'
+
+    growth = entry.get("growth") or {}
+    growth_text = ""
+    if growth.get("messages") is not None:
+        growth_text = f"+{human_count(growth['messages'])} 封 / 24h"
+    elif entry.get("growth") is not None:
+        growth_text = "积累中"
+    if str(entry.get("container_state")) == "running":
+        power = (
+            f'<input type="hidden" name="action" value="stop">'
+            f'<button class="btn btn-ghost btn-small" type="submit">停止</button>'
+        )
+    else:
+        power = (
+            f'<input type="hidden" name="action" value="start">'
+            f'<button class="btn btn-ghost btn-small" type="submit">启动</button>'
+        )
+    return f"""
+          <tr>
+            <td class="cell-main"><a href="/admin/instance/{instance_id}">{e(entry.get('email'))}</a>
+              <div class="cell-sub">{e(entry.get('provider_name') or 'IMAP')} · {e(entry.get('imap_host'))}</div>
+              {error}</td>
+            <td><span class="status-badge status-{kind}"><span></span> {e(label)}</span></td>
+            <td class="num">{e(scope_main)}
+              <div class="cell-sub">{e(scope_names)}</div>{extra}</td>
+            <td class="num">{human_count(entry.get('messages'))}
+              <div class="cell-sub">{e(growth_text)}</div></td>
+            <td class="num">{human_bytes(entry.get('total_bytes'))}</td>
+            <td class="nowrap">{_date(entry.get('newest_mail'))}</td>
+            <td class="num">{_pending_cell(int(entry.get('pending') or 0))}</td>
+            <td class="row-actions">
+              <div class="action-row">
+                <a class="btn btn-ghost btn-small" href="/admin/instance/{instance_id}">详情</a>
+                <form method="post" action="/admin/action" class="inline-form">
+                  <input type="hidden" name="csrf" value="{e(csrf)}">
+                  <input type="hidden" name="instance" value="{instance_id}">
+                  {power}
+                </form>
+              </div>
+            </td>
+          </tr>"""
+
+
+def _pending_cell(value: int) -> str:
+    return f'<span class="warn-text">{value:,}</span>' if value else "0"
+
+
+def _date(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "—"
+    try:
+        stamp = datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return e(text[:19])
+    return e(stamp.astimezone().strftime("%Y-%m-%d %H:%M"))
+
+
+def _ts(value: Any) -> str:
+    try:
+        stamp = int(value or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if stamp <= 0:
+        return "—"
+    return e(time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp)))
+
+
+def _ago(value: Any) -> str:
+    try:
+        stamp = int(value or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if stamp <= 0:
+        return "—"
+    delta = max(0, int(time.time()) - stamp)
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{delta // 60} 分钟前"
+    if delta < 86400:
+        return f"{delta // 3600} 小时前"
+    return f"{delta // 86400} 天前"
 
 
 # ---------------------------------------------------------------------------

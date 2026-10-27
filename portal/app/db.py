@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS invites (
@@ -65,6 +65,19 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at);
+
+-- Periodic snapshots of one instance's size, used to show "last 24h" growth
+-- on the admin console.  One row per instance per collection (~5 min), pruned
+-- to 30 days by the collector.
+CREATE TABLE IF NOT EXISTS instance_samples (
+    instance_id TEXT    NOT NULL,
+    at          INTEGER NOT NULL,
+    messages    INTEGER NOT NULL DEFAULT 0,
+    bytes       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (instance_id, at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_samples_at ON instance_samples(at);
 """
 
 
@@ -427,8 +440,8 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 """SELECT id, email, container_name, config_volume, data_volume,
-                          host_port, imap_host, status, last_error, created_at, updated_at,
-                          last_seen_at, folders
+                          host_port, imap_host, imap_port, provider_name, status,
+                          last_error, created_at, updated_at, last_seen_at, folders
                    FROM instances ORDER BY created_at DESC"""
             ).fetchall()
         return [dict(row) for row in rows]
@@ -438,6 +451,52 @@ class Database:
             self._conn.execute(
                 "UPDATE instances SET status = 'removed', updated_at = ? WHERE id = ?",
                 (now(), instance_id),
+            )
+
+    # -- stats samples ---------------------------------------------------
+    def record_instance_sample(
+        self, instance_id: str, *, at: int, messages: int, bytes_: int
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO instance_samples (instance_id, at, messages, bytes)
+                   VALUES (?, ?, ?, ?)""",
+                (instance_id, int(at), int(messages), int(bytes_)),
+            )
+
+    def growth_since(self, instance_id: str, *, since: int) -> dict[str, Any] | None:
+        """Compare the newest sample with the newest one older than ``since``.
+
+        Returns ``None`` when there is no sample at all yet.  ``messages`` and
+        ``bytes`` are ``None`` while the history is shorter than ``since``, so
+        the page can show "还在积累" instead of a misleading zero.
+        """
+        with self._lock:
+            latest = self._conn.execute(
+                """SELECT at, messages, bytes FROM instance_samples
+                   WHERE instance_id = ? ORDER BY at DESC LIMIT 1""",
+                (instance_id,),
+            ).fetchone()
+            if latest is None:
+                return None
+            base = self._conn.execute(
+                """SELECT at, messages, bytes FROM instance_samples
+                   WHERE instance_id = ? AND at <= ? ORDER BY at DESC LIMIT 1""",
+                (instance_id, int(since)),
+            ).fetchone()
+        if base is None:
+            return {"since": None, "messages": None, "bytes": None, "latest_at": int(latest["at"])}
+        return {
+            "since": int(base["at"]),
+            "messages": max(0, int(latest["messages"]) - int(base["messages"])),
+            "bytes": max(0, int(latest["bytes"]) - int(base["bytes"])),
+            "latest_at": int(latest["at"]),
+        }
+
+    def prune_samples(self, *, before: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM instance_samples WHERE at < ?", (int(before),)
             )
 
     # -- audit -----------------------------------------------------------
@@ -455,3 +514,12 @@ class Database:
                 "INSERT INTO audit_log (at, ip, action, email, detail) VALUES (?, ?, ?, ?, ?)",
                 (now(), ip, action, email, payload),
             )
+
+    def recent_audit(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT at, ip, action, email, detail FROM audit_log
+                   ORDER BY id DESC LIMIT ?""",
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]

@@ -15,6 +15,7 @@ from .docker_cli import DockerClient, DockerError
 from .gateway import Gateway
 from .provisioner import Provisioner
 from .security import RateLimiter, TokenService
+from .stats import StatsCollector
 from .web import WebApp
 
 log = logging.getLogger("app")
@@ -113,8 +114,23 @@ def main() -> int:
     limiter = RateLimiter()
     provisioner = Provisioner(config, db, docker, tokens)
     gateway = Gateway(config, db, docker, tokens, limiter)
-    web = WebApp(config, db, tokens, provisioner, gateway, limiter)
+    stats = StatsCollector(config, db, docker)
+    web = WebApp(
+        config,
+        db,
+        tokens,
+        provisioner,
+        gateway,
+        limiter,
+        stats=stats,
+        docker=docker,
+    )
     server = web.create_server()
+    if config.admin_password:
+        stats.start()
+        log.info("admin console enabled at /admin (stats every %ds)", config.stats_interval_seconds)
+    else:
+        log.info("admin console disabled: set MSM_ADMIN_PASSWORD to enable /admin")
 
     def _stop(signum: int, _frame: object) -> None:
         log.info("received signal %s, shutting down", signum)
@@ -137,6 +153,7 @@ def main() -> int:
         server.serve_forever()
     finally:
         server.server_close()
+        stats.stop()
         db.close()
         log.info("portal stopped")
     return 0

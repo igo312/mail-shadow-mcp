@@ -2,6 +2,9 @@
 /data/
 .env
 
+# Scratch: rendered pages, one-off scripts, copied deployment configs
+.tmp/
+
 # Python
 __pycache__/
 *.pyc

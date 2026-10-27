@@ -9,11 +9,11 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from . import templates
 from .config import Config
-from .db import Database
+from .db import Database, now
 from .gateway import Gateway
 from .provisioner import (
     ProvisionError,
@@ -22,12 +22,16 @@ from .provisioner import (
 )
 from .providers import normalize_email
 from .security import CookieError, RateLimiter, TokenService, constant_time_equal
+from .stats import StatsCollector, empty_entry
 
 log = logging.getLogger(__name__)
 
 MAX_FORM_BYTES = 64 * 1024
 SESSION_COOKIE = "msm_session"
 FLASH_COOKIE = "msm_flash"
+ADMIN_COOKIE = "msm_admin"
+ADMIN_FLASH_COOKIE = "msm_admin_flash"
+ADMIN_ACTIONS = {"start", "stop", "restart", "remove"}
 
 _CSP = (
     "default-src 'none'; "
@@ -60,6 +64,9 @@ class WebApp:
         provisioner: Provisioner,
         gateway: Gateway,
         limiter: RateLimiter,
+        *,
+        stats: StatsCollector | None = None,
+        docker: Any = None,
     ) -> None:
         self.config = config
         self.db = db
@@ -67,6 +74,8 @@ class WebApp:
         self.provisioner = provisioner
         self.gateway = gateway
         self.limiter = limiter
+        self.stats = stats
+        self.docker = docker if docker is not None else getattr(provisioner, "docker", None)
         self.static_dir = Path(__file__).with_name("static")
         templates.set_public_url(config.public_url)
         self._server: PortalHTTPServer | None = None
@@ -150,6 +159,36 @@ class WebApp:
                 return
             if path == "/folders" and handler.command == "POST":
                 self._folders(handler)
+                return
+            if path == "/admin":
+                self._admin_home(handler)
+                return
+            if path == "/admin/login" and handler.command == "POST":
+                self._admin_login(handler)
+                return
+            if path == "/admin/logout" and handler.command == "POST":
+                self._admin_logout(handler)
+                return
+            if path == "/admin/refresh" and handler.command == "POST":
+                self._admin_refresh(handler)
+                return
+            if path == "/admin/action" and handler.command == "POST":
+                self._admin_action(handler)
+                return
+            if path == "/admin/invites":
+                self._admin_invites(handler)
+                return
+            if path == "/admin/invites/create" and handler.command == "POST":
+                self._admin_invite_create(handler)
+                return
+            if path == "/admin/invites/disable" and handler.command == "POST":
+                self._admin_invite_disable(handler)
+                return
+            if path == "/admin/audit":
+                self._admin_audit(handler)
+                return
+            if path.startswith("/admin/instance/") and handler.command == "GET":
+                self._admin_instance(handler, path[len("/admin/instance/") :])
                 return
             if path.startswith("/instance/") and handler.command == "GET":
                 self._instance(handler, path[len("/instance/") :])
@@ -581,6 +620,424 @@ class WebApp:
             clear_cookies=[SESSION_COOKIE, FLASH_COOKIE],
         )
 
+    # -- admin console ---------------------------------------------------
+    def _admin_guard(
+        self, handler: BaseHTTPRequestHandler, *, form: bool = False
+    ) -> tuple[str, str] | None:
+        """Return (cookie, csrf) for a signed-in admin, or render the gate."""
+        if not self.config.admin_password:
+            # No configured password means no console at all.  There is no
+            # default credential on purpose.
+            self._error(handler, 404, "页面不存在", "返回首页看看。", show_logout=False)
+            return None
+        cookie = _cookies(handler).get(ADMIN_COOKIE, "")
+        if cookie:
+            try:
+                self.tokens.parse_admin(cookie)
+            except CookieError:
+                pass
+            else:
+                return cookie, self.tokens.csrf_token(cookie)
+        if form:
+            self._html(
+                handler,
+                403,
+                templates.admin_login_page(error="管理会话已过期，请重新登录后再操作。"),
+            )
+        else:
+            self._html(handler, 200, templates.admin_login_page())
+        return None
+
+    def _admin_login(self, handler: BaseHTTPRequestHandler) -> None:
+        if not self.config.admin_password:
+            self._error(handler, 404, "页面不存在", "返回首页看看。", show_logout=False)
+            return
+        ip = _client_ip(handler, self.config)
+        decision = self.limiter.check(
+            f"admin-login:{ip}",
+            self.config.admin_rate_limit,
+            self.config.admin_rate_window,
+        )
+        if not decision.allowed:
+            self._html(
+                handler,
+                429,
+                templates.admin_login_page(
+                    error=f"尝试次数过多，请在 {decision.retry_after} 秒后重试。"
+                ),
+            )
+            return
+        if not self._origin_ok(handler):
+            self._html(
+                handler,
+                403,
+                templates.admin_login_page(error="请求来源无效，请用浏览器直接打开本页后重试。"),
+            )
+            return
+        try:
+            form = _read_form(handler)
+        except ValueError:
+            self._html(handler, 400, templates.admin_login_page(error="请求格式无效。"))
+            return
+        password = form.get("password") or ""
+        if not password or not constant_time_equal(password, self.config.admin_password):
+            # A short delay buys nothing against a slow network attacker but
+            # makes a tight local loop noticeably more expensive.
+            time.sleep(0.35)
+            self.db.audit("admin_login_failed", ip=ip)
+            self._html(handler, 401, templates.admin_login_page(error="密码不正确。"))
+            return
+        cookie = self.tokens.make_admin(self.config.admin_session_ttl_seconds)
+        self.db.audit("admin_login", ip=ip)
+        self._redirect(
+            handler,
+            "/admin",
+            cookies=[
+                (
+                    ADMIN_COOKIE,
+                    cookie,
+                    self.config.admin_session_ttl_seconds,
+                    "Strict",
+                )
+            ],
+        )
+
+    def _admin_logout(self, handler: BaseHTTPRequestHandler) -> None:
+        auth = self._admin_guard(handler, form=True)
+        if not auth:
+            return
+        cookie, csrf = auth
+        try:
+            form = _read_form(handler)
+        except ValueError:
+            self._html(handler, 400, templates.admin_login_page(error="请求格式无效。"))
+            return
+        if not self.tokens.verify_csrf(cookie, form.get("csrf") or ""):
+            self._html(handler, 400, templates.admin_login_page(error="页面已过期，请重新登录。"))
+            return
+        self._redirect(handler, "/admin", clear_cookies=[ADMIN_COOKIE])
+
+    def _admin_home(self, handler: BaseHTTPRequestHandler) -> None:
+        auth = self._admin_guard(handler)
+        if not auth:
+            return
+        _, csrf = auth
+        message, kind = _query_message(handler)
+        self._html(
+            handler,
+            200,
+            templates.admin_dashboard(
+                snapshot=self._snapshot(),
+                csrf=csrf,
+                message=message,
+                message_kind=kind,
+                stats_interval=self.config.stats_interval_seconds,
+            ),
+        )
+
+    def _admin_instance(self, handler: BaseHTTPRequestHandler, instance_id: str) -> None:
+        auth = self._admin_guard(handler)
+        if not auth:
+            return
+        _, csrf = auth
+        instance = self._load_instance(instance_id)
+        if not instance:
+            self._error(handler, 404, "实例不存在", "链接可能已经失效。")
+            return
+        snapshot = self._snapshot()
+        entry = (snapshot.get("instances") or {}).get(str(instance["id"])) or empty_entry(
+            instance
+        )
+        logs = ""
+        if self.docker is not None:
+            try:
+                logs = self.docker.logs(instance["container_name"], tail=80)
+            except Exception as exc:
+                logs = f"（读取容器日志失败：{exc}）"
+        message, kind = _query_message(handler)
+        self._html(
+            handler,
+            200,
+            templates.admin_instance_page(
+                instance=instance,
+                entry=entry,
+                csrf=csrf,
+                logs=logs,
+                message=message,
+                message_kind=kind,
+            ),
+        )
+
+    def _admin_invites(self, handler: BaseHTTPRequestHandler) -> None:
+        auth = self._admin_guard(handler)
+        if not auth:
+            return
+        _, csrf = auth
+        new_code = ""
+        clear: list[str] | None = None
+        raw_flash = _cookies(handler).get(ADMIN_FLASH_COOKIE, "")
+        if raw_flash:
+            clear = [ADMIN_FLASH_COOKIE]
+            try:
+                values = self.tokens.parse_admin_flash(raw_flash)
+            except CookieError:
+                values = None
+            if values:
+                new_code = str(values.get("code") or "")
+        message, kind = _query_message(handler)
+        self._html(
+            handler,
+            200,
+            templates.admin_invites_page(
+                invites=self.db.list_invites(),
+                csrf=csrf,
+                new_code=new_code,
+                message=message,
+                message_kind=kind,
+            ),
+            clear_cookies=clear,
+        )
+
+    def _admin_audit(self, handler: BaseHTTPRequestHandler) -> None:
+        auth = self._admin_guard(handler)
+        if not auth:
+            return
+        _, csrf = auth
+        self._html(
+            handler,
+            200,
+            templates.admin_audit_page(events=self.db.recent_audit(200), csrf=csrf),
+        )
+
+    def _admin_refresh(self, handler: BaseHTTPRequestHandler) -> None:
+        auth = self._admin_guard(handler, form=True)
+        if not auth:
+            return
+        cookie, _csrf = auth
+        form = self._admin_form(handler, cookie)
+        if form is None:
+            return
+        ip = _client_ip(handler, self.config)
+        if self.stats is not None:
+            self.stats.refresh()
+        self.db.audit("admin_refresh", ip=ip, detail={"by": "admin"})
+        self._back(
+            handler,
+            "/admin",
+            "已触发重新采集，几秒后刷新页面即可看到最新数据。",
+            "ok",
+        )
+
+    def _admin_invite_create(self, handler: BaseHTTPRequestHandler) -> None:
+        auth = self._admin_guard(handler, form=True)
+        if not auth:
+            return
+        cookie, _csrf = auth
+        form = self._admin_form(handler, cookie)
+        if form is None:
+            return
+        ip = _client_ip(handler, self.config)
+        label = (form.get("label") or "").strip()[:80]
+        uses = _int_or(form.get("uses"), 1, 1, 1000)
+        days = _int_or(form.get("days"), 30, 0, 3650)
+        code = self.tokens.new_invite_code()
+        expires_at = now() + days * 86400 if days > 0 else None
+        invite_id = self.db.create_invite(
+            self.tokens.hash_invite(code),
+            label=label,
+            max_uses=uses,
+            expires_at=expires_at,
+        )
+        self.db.audit(
+            "invite_created",
+            ip=ip,
+            detail={
+                "invite_id": invite_id,
+                "label": label,
+                "uses": uses,
+                "days": days,
+                "by": "admin",
+            },
+        )
+        flash = self.tokens.make_admin_flash({"code": code, "label": label})
+        self._redirect(
+            handler,
+            "/admin/invites",
+            cookies=[(ADMIN_FLASH_COOKIE, flash, 300, "Strict")],
+        )
+
+    def _admin_invite_disable(self, handler: BaseHTTPRequestHandler) -> None:
+        auth = self._admin_guard(handler, form=True)
+        if not auth:
+            return
+        cookie, _csrf = auth
+        form = self._admin_form(handler, cookie)
+        if form is None:
+            return
+        ip = _client_ip(handler, self.config)
+        invite_id = (form.get("invite") or "").strip()
+        disabled = self.db.disable_invite(invite_id) if invite_id else False
+        if disabled:
+            self.db.audit(
+                "invite_disabled",
+                ip=ip,
+                detail={"invite_id": invite_id, "by": "admin"},
+            )
+            self._back(handler, "/admin/invites", "邀请码已停用，无法再用于开通。", "ok")
+        else:
+            self._back(handler, "/admin/invites", "邀请码不存在或已停用。", "warn")
+
+    def _admin_action(self, handler: BaseHTTPRequestHandler) -> None:
+        auth = self._admin_guard(handler, form=True)
+        if not auth:
+            return
+        cookie, _csrf = auth
+        form = self._admin_form(handler, cookie)
+        if form is None:
+            return
+        instance = self._load_instance((form.get("instance") or "").strip())
+        action = (form.get("action") or "").strip()
+        back = f"/admin/instance/{instance['id']}" if instance else "/admin"
+        if instance is None:
+            self._back(handler, "/admin", "实例不存在。", "error")
+            return
+        if action not in ADMIN_ACTIONS:
+            self._back(handler, back, "未知操作。", "error")
+            return
+        if self.docker is None:
+            self._back(handler, back, "Docker 不可用，无法执行操作。", "error")
+            return
+
+        ip = _client_ip(handler, self.config)
+        name = instance["container_name"]
+        email = str(instance["email"])
+        if action == "remove":
+            confirm = (form.get("confirm") or "").strip().lower()
+            if confirm != email.strip().lower():
+                self._back(handler, back, "确认邮箱地址不一致，未执行删除。", "error")
+                return
+            try:
+                self.docker.remove_container(name)
+                self.docker.remove_volume(instance["config_volume"])
+                self.docker.remove_volume(instance["data_volume"])
+            except Exception as exc:
+                log.exception("admin remove failed for %s", email)
+                self.db.audit(
+                    "admin_action_failed",
+                    ip=ip,
+                    email=email,
+                    detail={"action": action, "error": str(exc)[:300]},
+                )
+                self._back(handler, back, f"删除失败：{exc}", "error")
+                return
+            self.db.mark_instance_removed(instance["id"])
+            self.db.audit(
+                "instance_removed",
+                ip=ip,
+                email=email,
+                detail={"instance_id": instance["id"], "by": "admin"},
+            )
+            if self.stats is not None:
+                self.stats.refresh()
+            self._back(handler, "/admin", f"已删除 {email} 的容器与数据卷。", "ok")
+            return
+
+        try:
+            if action == "start":
+                self.docker.start_container(name)
+                running = self.docker.container_running(name)
+                self.db.set_instance_status(
+                    instance["id"],
+                    "running" if running else "failed",
+                    error=None if running else "容器启动后未能运行，请查看日志",
+                )
+                message = (
+                    "实例已启动，开始补同步。"
+                    if running
+                    else "docker start 已执行，但容器没有运行起来，请查看日志。"
+                )
+                kind = "ok" if running else "warn"
+            elif action == "stop":
+                self.docker.stop_container(name)
+                self.db.set_instance_status(instance["id"], "stopped", error=None)
+                message = "实例已暂停：容器已停止，MCP 请求会被拒绝，数据保留。"
+                kind = "ok"
+            else:
+                self.docker.restart_container(name)
+                self.db.set_instance_status(instance["id"], "running", error=None)
+                message = "容器已重启，几秒后重新就绪。"
+                kind = "ok"
+        except Exception as exc:
+            log.exception("admin action %s failed for %s", action, email)
+            self.db.audit(
+                "admin_action_failed",
+                ip=ip,
+                email=email,
+                detail={"action": action, "error": str(exc)[:300]},
+            )
+            self._back(handler, back, f"操作失败：{exc}", "error")
+            return
+
+        self.db.audit(
+            "admin_action",
+            ip=ip,
+            email=email,
+            detail={"action": action, "by": "admin"},
+        )
+        if self.stats is not None:
+            self.stats.refresh()
+        self._back(handler, back, message, kind)
+
+    def _admin_form(
+        self, handler: BaseHTTPRequestHandler, cookie: str
+    ) -> dict[str, str] | None:
+        """Read and CSRF-check an admin form; returns None after rendering an error."""
+        if not self._origin_ok(handler):
+            self._html(handler, 403, templates.admin_login_page(error="请求来源无效。"))
+            return None
+        try:
+            form = _read_form(handler)
+        except ValueError:
+            self._html(handler, 400, templates.admin_login_page(error="表单数据无效。"))
+            return None
+        if not self.tokens.verify_csrf(cookie, form.get("csrf") or ""):
+            self._html(
+                handler,
+                400,
+                templates.admin_login_page(error="页面已过期，请刷新后重试。"),
+            )
+            return None
+        return form
+
+    def _load_instance(self, instance_id: str) -> dict[str, Any] | None:
+        if (
+            not instance_id
+            or len(instance_id) > 64
+            or not all(ch in "0123456789abcdef" for ch in instance_id)
+        ):
+            return None
+        try:
+            return self.db.get_instance(instance_id)
+        except Exception:
+            log.exception("could not load instance %s", instance_id)
+            return None
+
+    def _snapshot(self) -> dict[str, Any]:
+        if self.stats is None:
+            return {"generated_at": 0, "instances": {}, "host": {}, "error": ""}
+        return self.stats.snapshot()
+
+    def _back(
+        self,
+        handler: BaseHTTPRequestHandler,
+        path: str,
+        message: str,
+        kind: str,
+    ) -> None:
+        separator = "&" if "?" in path else "?"
+        query = urlencode({"msg": message[:300], "kind": kind})
+        self._redirect(handler, f"{path}{separator}{query}")
+
     # -- session / cookies ----------------------------------------------
     def _session(self, handler: BaseHTTPRequestHandler) -> tuple[dict[str, Any] | None, str]:
         cookie = _cookies(handler).get(SESSION_COOKIE, "")
@@ -666,9 +1123,20 @@ class WebApp:
             handler.wfile.write(data)
 
     # -- response helpers ------------------------------------------------
-    def _start(self, handler: BaseHTTPRequestHandler, status: int) -> None:
+    def _start(
+        self,
+        handler: BaseHTTPRequestHandler,
+        status: int,
+        *,
+        cookies: list[tuple[str, str, int, str]] | None = None,
+        clear_cookies: list[str] | None = None,
+    ) -> None:
         handler._sent_headers = True  # type: ignore[attr-defined]
         handler.send_response(status)
+        for name, value, max_age, same_site in cookies or []:
+            self._set_cookie(handler, name, value, max_age, same_site=same_site)
+        for name in clear_cookies or []:
+            self._clear_cookie(handler, name)
         handler.send_header("X-Content-Type-Options", "nosniff")
         handler.send_header("X-Frame-Options", "DENY")
         handler.send_header("Referrer-Policy", "no-referrer")
@@ -679,9 +1147,17 @@ class WebApp:
                 "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
             )
 
-    def _html(self, handler: BaseHTTPRequestHandler, status: int, body: str) -> None:
+    def _html(
+        self,
+        handler: BaseHTTPRequestHandler,
+        status: int,
+        body: str,
+        *,
+        cookies: list[tuple[str, str, int, str]] | None = None,
+        clear_cookies: list[str] | None = None,
+    ) -> None:
         data = body.encode("utf-8")
-        self._start(handler, status)
+        self._start(handler, status, cookies=cookies, clear_cookies=clear_cookies)
         handler.send_header("Content-Type", "text/html; charset=utf-8")
         handler.send_header("Content-Length", str(len(data)))
         handler.send_header("Cache-Control", "no-store")
@@ -723,11 +1199,9 @@ class WebApp:
         cookies: list[tuple[str, str, int, str]] | None = None,
         clear_cookies: list[str] | None = None,
     ) -> None:
-        self._start(handler, status)
-        for name, value, max_age, same_site in cookies or []:
-            self._set_cookie(handler, name, value, max_age, same_site=same_site)
-        for name in clear_cookies or []:
-            self._clear_cookie(handler, name)
+        self._start(
+            handler, status, cookies=cookies, clear_cookies=clear_cookies
+        )
         handler.send_header("Location", location)
         handler.send_header("Content-Length", "0")
         handler.send_header("Cache-Control", "no-store")
@@ -804,3 +1278,25 @@ def _read_form_values(handler: BaseHTTPRequestHandler) -> dict[str, list[str]]:
 
 def _read_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
     return {key: values[-1] for key, values in _read_form_values(handler).items()}
+
+
+def _query_message(handler: BaseHTTPRequestHandler) -> tuple[str, str]:
+    """Read the ``?msg=&kind=`` pair used to report an admin action's outcome."""
+    try:
+        query = parse_qs(urlsplit(handler.path).query, max_num_fields=8)
+    except ValueError:
+        return "", "info"
+    message = (query.get("msg") or [""])[-1][:300]
+    kind = (query.get("kind") or ["ok"])[-1]
+    if kind not in {"ok", "warn", "error", "info"}:
+        kind = "info"
+    return message, kind
+
+
+def _int_or(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+

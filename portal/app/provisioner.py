@@ -31,6 +31,7 @@ from .docker_cli import (
     ContainerSpec,
     DockerClient,
     DockerError,
+    container_is_running,
     container_spec_hash,
     instance_label,
 )
@@ -468,8 +469,11 @@ class Provisioner:
                     self._repair_token_hash(instance_id, instance["email"], token_hash)
                     repaired_token = True
                 # Repair status/port drift without recreating a healthy
-                # container (e.g. after a portal crash mid-provision).
-                if instance["status"] != "running":
+                # container (e.g. after a portal crash mid-provision).  A
+                # container the operator stopped on purpose stays "stopped":
+                # the gateway refuses MCP requests for non-running instances,
+                # so flipping the row back would silently re-enable it.
+                if instance["status"] != "running" and container_is_running(info):
                     self.db.set_instance_status(instance_id, "running", error=None)
                 if self.config.backend_mode == "port" and info is not None:
                     host_port = self.docker.container_host_port(name, self.config.backend_port)

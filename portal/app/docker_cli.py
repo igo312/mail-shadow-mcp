@@ -150,6 +150,18 @@ class DockerClient:
         result = self._run("docker version", ["version", "--format", "{{.Server.Version}}"], timeout=15)
         return result.stdout.strip()
 
+    def docker_root(self) -> str:
+        """Return the daemon's data root (named volumes live under <root>/volumes)."""
+        result = self._run(
+            "docker info",
+            ["info", "--format", "{{.DockerRootDir}}"],
+            timeout=20,
+            check=False,
+        )
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
     def network_exists(self, name: str) -> bool:
         result = self._run(
             "inspect network",
@@ -351,6 +363,44 @@ class DockerClient:
 
     def start_container(self, name: str) -> None:
         self._run("start container", ["start", name], timeout=60)
+
+    def stop_container(self, name: str) -> None:
+        # --time 10 matches the container's own stop-timeout: the MCP server
+        # gets a chance to checkpoint SQLite before the process is killed.
+        self._run("stop container", ["stop", "--time", "10", name], timeout=60)
+
+    def restart_container(self, name: str) -> None:
+        self._run("restart container", ["restart", "--time", "10", name], timeout=90)
+
+    def container_stats(self) -> dict[str, dict[str, Any]]:
+        """One-shot CPU/memory/network snapshot for every running container.
+
+        A single ``docker stats --no-stream`` call samples all containers at
+        once (~1-2 s); asking per container would take the same time each.
+        Failures are not fatal for the admin console.
+        """
+        result = self._run(
+            "container stats",
+            ["stats", "--no-stream", "--format", "{{json .}}"],
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise DockerError(
+                "container stats", (result.stderr or "").strip()[-300:] or "docker stats failed"
+            )
+        rows: dict[str, dict[str, Any]] = {}
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and parsed.get("Name"):
+                rows[str(parsed["Name"])] = parsed
+        return rows
 
     def inspect_container(self, name: str) -> dict[str, Any] | None:
         """Return a container's inspect object.
