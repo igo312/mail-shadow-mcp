@@ -37,6 +37,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -876,36 +877,59 @@ func (c *Client) finishFolder(db *sql.DB, logger *slog.Logger, folder string) er
 // "up to date" runs) and is resumable via mail_content.cjk_indexed.
 func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) error {
 	const (
-		// The query materialises body_text for each row.  Keep the batch small:
-		// 25 × the 256 KB body cap is ~6 MB, safe inside a 128 MB container.
-		// The per-sync cap controls how many rows one folder can backfill per
-		// sync pass, not peak memory (the batches are still 25 rows).  A large
-		// legacy mailbox would otherwise need hundreds of 5-minute passes:
-		// 20k keeps a 450k-message folder to ~23 passes instead of ~230, while
-		// still yielding between batches.
-		batchSize  = 25
-		maxPerSync = 20000
+		// 200 rows amortises the per-batch FTS scan and transaction.  At 25 rows
+		// the per-batch overhead dominated the entire backfill.
+		batchSize = 200
+		// Yield regularly so a long backfill cannot monopolise the single
+		// writer while MCP queries are being served.
+		yieldEvery = 25
+		yieldFor   = 20 * time.Millisecond
 	)
 	total := 0
-	for total < maxPerSync {
+	batches := 0
+	// Keyset cursor on imap_uid, persisted in sync_state so the next pass (or a
+	// restart) resumes where this one stopped.  Re-reading it every pass is what
+	// keeps the work linear: the previous version restarted at the first UID and
+	// re-scanned every already indexed row.
+	var cursor uint32
+	var done int
+	if err := db.QueryRow(
+		`SELECT cjk_backfill_done, cjk_cursor_uid FROM sync_state
+		  WHERE account_id = ? AND imap_folder = ?`,
+		c.cfg.ID, folder,
+	).Scan(&done, &cursor); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("backfillCJK: read cursor: %w", err)
+	}
+	if done == 1 {
+		// Finished folders are skipped entirely.  The lookup above is a single
+		// row on the primary key; without this early return every sync pass
+		// re-scanned the folder and probed a body page per message just to
+		// discover that nothing was left to do (the main source of read
+		// amplification on large mailboxes).
+		return nil
+	}
+	startedFromZero := cursor == 0
+	for {
 		rows, err := db.Query(`
-			SELECT e.id, e.subject, COALESCE(c.body_text, '')
+			SELECT e.id, e.subject, e.imap_uid, COALESCE(c.body_text, '')
 			FROM mail_entries e
 			LEFT JOIN mail_content c ON c.entry_id = e.id
 			WHERE e.account_id = ? AND e.imap_folder = ?
+			  AND e.imap_uid > ?
 			  AND (c.cjk_indexed IS NULL OR c.cjk_indexed = 0)
 			ORDER BY e.imap_uid
-			LIMIT ?`, c.cfg.ID, folder, batchSize)
+			LIMIT ?`, c.cfg.ID, folder, cursor, batchSize)
 		if err != nil {
 			return fmt.Errorf("backfillCJK: query: %w", err)
 		}
 		type item struct {
 			id, subject, body string
+			uid               uint32
 		}
 		var items []item
 		for rows.Next() {
 			var it item
-			if err := rows.Scan(&it.id, &it.subject, &it.body); err == nil {
+			if err := rows.Scan(&it.id, &it.subject, &it.uid, &it.body); err == nil {
 				items = append(items, it)
 			}
 		}
@@ -918,22 +942,32 @@ func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) err
 			// Nothing left in this folder: searches may now use the auxiliary
 			// index.  Until this flag is set, queries use the bounded substring
 			// fallback so they cannot silently omit unindexed older mail.
+			if startedFromZero {
+				// A database upgraded from a build that had mail_cjk_fts but no
+				// cjk_indexed column can already contain FTS rows for messages we
+				// just indexed again.  De-duplicate once per folder instead of
+				// deleting per batch: the per-batch delete had to scan the whole
+				// FTS table every time.
+				dedupeCJKIndex(db, logger)
+			}
 			markCJKBackfillDone(db, logger, c.cfg.ID, folder)
 			return nil
 		}
+
+		// Advance past this batch even when individual rows fail: they keep
+		// cjk_indexed = 0 and are retried on the next pass, while the cursor
+		// guarantees this pass cannot spin on the same rows forever.
+		nextCursor := items[len(items)-1].uid
 
 		tx, err := db.Begin()
 		if err != nil {
 			return fmt.Errorf("backfillCJK: begin tx: %w", err)
 		}
-		del, err := tx.Prepare(`DELETE FROM mail_cjk_fts WHERE entry_id = ?`)
-		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("backfillCJK: prepare delete: %w", err)
-		}
+		// One DELETE for the whole batch.  mail_cjk_fts.entry_id is UNINDEXED,
+		// so each of these statements scans the FTS table; doing it per row (as
+		// before) turned the backfill into one full FTS scan per message.
 		ins, err := tx.Prepare(`INSERT INTO mail_cjk_fts (entry_id, text) VALUES (?, ?)`)
 		if err != nil {
-			del.Close()
 			tx.Rollback()
 			return fmt.Errorf("backfillCJK: prepare insert: %w", err)
 		}
@@ -941,16 +975,20 @@ func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) err
 			VALUES (?, ?, 1)
 			ON CONFLICT(entry_id) DO UPDATE SET cjk_indexed = 1`)
 		if err != nil {
-			del.Close()
 			ins.Close()
 			tx.Rollback()
 			return fmt.Errorf("backfillCJK: prepare mark: %w", err)
 		}
+		moveCursor, err := tx.Prepare(
+			`UPDATE sync_state SET cjk_cursor_uid = ? WHERE account_id = ? AND imap_folder = ?`,
+		)
+		if err != nil {
+			ins.Close()
+			mark.Close()
+			tx.Rollback()
+			return fmt.Errorf("backfillCJK: prepare cursor: %w", err)
+		}
 		for _, it := range items {
-			if _, err := del.Exec(it.id); err != nil {
-				logger.Warn("backfillCJK: delete old row", "entry_id", it.id, "err", err)
-				continue
-			}
 			text := it.subject + "\n" + it.body
 			if maildb.HasCJK(text) {
 				if _, err := ins.Exec(it.id, maildb.CJKIndexText(text)); err != nil {
@@ -962,13 +1000,25 @@ func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) err
 				logger.Warn("backfillCJK: mark indexed", "entry_id", it.id, "err", err)
 			}
 		}
-		del.Close()
+		if _, err := moveCursor.Exec(nextCursor, c.cfg.ID, folder); err != nil {
+			ins.Close()
+			mark.Close()
+			moveCursor.Close()
+			tx.Rollback()
+			return fmt.Errorf("backfillCJK: move cursor: %w", err)
+		}
 		ins.Close()
 		mark.Close()
+		moveCursor.Close()
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("backfillCJK: commit: %w", err)
 		}
+		cursor = nextCursor
 		total += len(items)
+		batches++
+		if batches%yieldEvery == 0 {
+			time.Sleep(yieldFor)
+		}
 	}
 	if total > 0 {
 		logger.Info("CJK index backfill progress", "processed", total)
@@ -976,12 +1026,24 @@ func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) err
 	return nil
 }
 
+// dedupeCJKIndex removes duplicate CJK index rows for the same message, keeping
+// the first rowid.  It runs once per folder, when a backfill starts from the
+// beginning, because only databases upgraded from a pre-cjk_indexed build can
+// contain duplicates.
+func dedupeCJKIndex(db *sql.DB, logger *slog.Logger) {
+	if _, err := db.Exec(`
+		DELETE FROM mail_cjk_fts
+		 WHERE rowid NOT IN (SELECT MIN(rowid) FROM mail_cjk_fts GROUP BY entry_id)`); err != nil {
+		logger.Warn("backfillCJK: could not de-duplicate CJK index", "err", err)
+	}
+}
+
 // markCJKBackfillDone records that this folder no longer has messages missing
 // from the auxiliary CJK index.  Search uses this flag to decide between the
 // fast CJK index and the complete-but-slower bounded substring fallback.
 func markCJKBackfillDone(db *sql.DB, logger *slog.Logger, accountID, folder string) {
 	if _, err := db.Exec(
-		`UPDATE sync_state SET cjk_backfill_done = 1
+		`UPDATE sync_state SET cjk_backfill_done = 1, cjk_cursor_uid = 0
 		 WHERE account_id = ? AND imap_folder = ?`, accountID, folder,
 	); err != nil {
 		logger.Warn("backfillCJK: could not mark backfill complete", "err", err)
@@ -1206,7 +1268,9 @@ func checkAndResetUIDValidity(db *sql.DB, logger *slog.Logger, accountID, folder
 		return 0, fmt.Errorf("sync: purge stale entries: %w", err)
 	}
 	if _, err := db.Exec(
-		`UPDATE sync_state SET last_uid = 0, uid_validity = ? WHERE account_id = ? AND imap_folder = ?`,
+		`UPDATE sync_state SET last_uid = 0, uid_validity = ?,
+		     cjk_cursor_uid = 0, cjk_backfill_done = 0
+		 WHERE account_id = ? AND imap_folder = ?`,
 		uint32(selData.UIDValidity), accountID, folder,
 	); err != nil {
 		return 0, fmt.Errorf("sync: reset sync_state: %w", err)

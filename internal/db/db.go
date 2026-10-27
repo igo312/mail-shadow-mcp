@@ -189,6 +189,13 @@ func Migrate(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_mail_account_folder
 			ON mail_entries(account_id, imap_folder)`,
 
+		// Backfill walks one folder in imap_uid order with a keyset cursor
+		// (imap_uid > ?).  Without this exact column order SQLite has to sort
+		// the whole folder for every batch, which made the CJK backfill
+		// quadratic on large mailboxes.
+		`CREATE INDEX IF NOT EXISTS idx_mail_folder_uid
+			ON mail_entries(account_id, imap_folder, imap_uid)`,
+
 		`CREATE INDEX IF NOT EXISTS idx_mail_sender
 			ON mail_entries(sender)`,
 
@@ -211,6 +218,10 @@ func Migrate(db *sql.DB) error {
 		// backfill marks it done.  Existing rows default to 0, which is the safe
 		// (complete but slower) choice after an upgrade.
 		`ALTER TABLE sync_state ADD COLUMN cjk_backfill_done INTEGER NOT NULL DEFAULT 0`,
+		// Resume point of the CJK backfill (highest imap_uid already processed).
+		// Without it every pass restarts at the first UID and re-scans all
+		// indexed rows, which is what made the backfill quadratic.
+		`ALTER TABLE sync_state ADD COLUMN cjk_cursor_uid INTEGER NOT NULL DEFAULT 0`,
 		// Nullable: NULL means "flags not yet fetched" (pre-migration rows or backfill pending).
 		`ALTER TABLE mail_entries ADD COLUMN is_read    INTEGER`,
 		`ALTER TABLE mail_entries ADD COLUMN is_replied INTEGER`,
