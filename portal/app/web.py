@@ -362,6 +362,8 @@ class WebApp:
                 port=port,
                 tls_mode=tls_mode,
                 provider_key=provider_key,
+                selected_folders=selected_folders,
+                folders_all=folders_mode == "all",
             )
             return
 
@@ -483,6 +485,7 @@ class WebApp:
         tls_mode: str = "tls",
         provider_key: str = "auto",
         selected_folders: list[str] | None = None,
+        folders_all: bool = False,
     ) -> None:
         self._html(
             handler,
@@ -498,6 +501,7 @@ class WebApp:
                 field=field,
                 hint=hint,
                 selected_folders=selected_folders,
+                folders_all=folders_all,
             ),
         )
 

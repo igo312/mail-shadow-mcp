@@ -206,6 +206,20 @@ class ListFoldersTest(unittest.TestCase):
         self.assertIsNone(_parse_list_entry(b'(\\Noselect) "/" "Parent"'))
         self.assertIsNone(_parse_list_entry(b"garbage"))
 
+    def test_parses_literal_list_entries(self) -> None:
+        # imaplib returns (header, literal) for a server that uses an IMAP
+        # literal instead of a quoted mailbox name.
+        self.assertEqual(
+            _parse_list_entry((b'(\\HasNoChildren) "/" {7}', b"Archive")), "Archive"
+        )
+        self.assertEqual(
+            _parse_list_entry((b'(\\HasNoChildren) "/" {12}', b"&XfJT0ZAB-")),
+            "已发送",
+        )
+        self.assertIsNone(
+            _parse_list_entry((b'(\\Noselect) "/" {6}', b"Parent"))
+        )
+
     def test_list_folders_returns_inbox_first(self) -> None:
         server = FakeIMAPServer(
             folders=[

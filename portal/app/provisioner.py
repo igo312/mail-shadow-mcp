@@ -600,20 +600,64 @@ class Provisioner:
             token = self.tokens.derive_mcp_token(email, password, salt)
             token_hash = self.tokens.hash_mcp_token(token)
             same_token = constant_time_equal(existing["token_hash"], token_hash)
+            folders_changed = folders is not None and folder_selection_changed(
+                folders, folders_from_instance(existing)
+            )
+
+            # Recovery must come first.  The folder branch below keeps the
+            # existing token on purpose, so running it before this check would
+            # resurrect the token of a deleted/failed instance and skip the
+            # salt rotation that makes removal durable.
+            if existing["status"] in {"removed", "failed"} or stale_provisioning:
+                salt = new_salt
+                token = self.tokens.derive_mcp_token(email, password, salt)
+                token_hash = self.tokens.hash_mcp_token(token)
+                if folders_changed:
+                    self.db.set_instance_folders(existing["id"], folders_to_json(folders))
+                self.db.update_instance_credentials(
+                    existing["id"],
+                    idem_hash=idem_hash,
+                    token_hash=token_hash,
+                    token_salt=salt,
+                    imap_host=settings.host,
+                    imap_port=settings.port,
+                    tls_mode=settings.tls_mode,
+                    provider_key=settings.provider_key,
+                    provider_name=settings.provider_name,
+                )
+                instance = self.db.get_instance(existing["id"])
+                assert instance is not None
+                self._recreate(
+                    instance,
+                    password=password,
+                    settings=settings,
+                    token=token,
+                    folders=folders,
+                )
+                return ProvisionResult(
+                    instance=self.db.get_instance(existing["id"]),
+                    token=token,
+                    reused=True,
+                    rotated=False,
+                    warning="实例已重建，MCP Token 已轮换，请使用下面的新配置。",
+                )
 
             # Re-submitting the same credentials with a different folder
             # selection is a *configuration* change, not a credential change:
             # keep the token (existing MCP clients keep working), rewrite the
             # config and restart the container so the sync engine picks the new
             # folders up.
-            if folders is not None and folder_selection_changed(
-                folders, folders_from_instance(existing)
-            ):
+            if folders_changed:
                 # Changing the folder scope must not silently reset this
                 # instance's own sync interval / jitter / TLS settings; read them
                 # back from the config volume (the only stored copy).
                 preserved = self._read_existing_settings(existing)
                 self.db.set_instance_folders(existing["id"], folders_to_json(folders))
+                # An interrupted earlier rotation can leave the routing hash
+                # stale while the config is about to carry `token`; align it or
+                # the gateway rejects the token the user is shown.
+                if not same_token:
+                    self.db.set_instance_token_hash(existing["id"], token_hash)
                 updated = self.db.get_instance(existing["id"]) or existing
                 self._recreate(
                     updated,
@@ -642,11 +686,7 @@ class Provisioner:
             # Master-key rotation (or an interrupted previous run) can leave the
             # stored token hash stale.  Rewriting the config and recreating the
             # container repairs it without asking the user for anything new.
-            if not same_token or existing["status"] in {"removed", "failed"} or stale_provisioning:
-                if existing["status"] in {"removed", "failed"} or stale_provisioning:
-                    salt = new_salt
-                    token = self.tokens.derive_mcp_token(email, password, salt)
-                    token_hash = self.tokens.hash_mcp_token(token)
+            if not same_token:
                 self.db.update_instance_credentials(
                     existing["id"],
                     idem_hash=idem_hash,

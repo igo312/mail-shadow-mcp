@@ -327,6 +327,31 @@ class ProvisionerTest(unittest.TestCase):
             self.db.get_instance_by_token_hash(tokens.hash_mcp_token(again.token))
         )
 
+    def test_removed_instance_with_new_folders_still_rotates_token(self) -> None:
+        # The folder-change branch keeps the token on purpose.  Recovery from
+        # removed/failed must run first, otherwise re-submitting the old
+        # credentials with a different folder selection resurrects the token
+        # that the delete was supposed to revoke.
+        _, docker, tokens, provisioner = self._provisioner()
+        first = provisioner.provision(
+            "user@gmail.com", "password", folders=["INBOX"]
+        )
+        old_hash = tokens.hash_mcp_token(first.token)
+        provisioner.remove_instance(first.instance["id"], purge_data=False)
+
+        again = provisioner.provision(
+            "user@gmail.com", "password", folders=["Archive"]
+        )
+        self.assertEqual(again.instance["status"], "running")
+        self.assertNotEqual(again.token, first.token)
+        self.assertIsNone(self.db.get_instance_by_token_hash(old_hash))
+        self.assertEqual(len(docker.runs), 2)
+        self.assertEqual(again.instance["folders"], '["Archive"]')
+        self.assertIn(
+            'folders: ["Archive"]',
+            docker.configs[first.instance["config_volume"]],
+        )
+
     def test_stale_provisioning_is_retried(self) -> None:
         _, docker, _, provisioner = self._provisioner()
         first = provisioner.provision("user@gmail.com", "password")

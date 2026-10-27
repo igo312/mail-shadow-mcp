@@ -183,8 +183,33 @@ def _decode_modified_utf7(value: str) -> str:
 
 
 def _parse_list_entry(raw: Any) -> str | None:
-    """Parse one ``LIST`` response line into a folder name."""
-    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    """Parse one ``LIST`` response line into a folder name.
+
+    ``imaplib`` returns a plain bytes line for most folders, but a
+    ``(header, literal)`` tuple when the server used an IMAP literal (which is
+    what names with special characters such as ``{7}`` arrive as).  Converting
+    that tuple with ``str()`` produces Python repr text, not the folder name.
+    """
+    literal_name: str | None = None
+    if isinstance(raw, tuple):
+        if not raw:
+            return None
+        header = raw[0]
+        if len(raw) > 1 and raw[1] is not None:
+            literal = raw[1]
+            literal_name = (
+                bytes(literal).decode("utf-8", "replace")
+                if isinstance(literal, (bytes, bytearray))
+                else str(literal)
+            )
+        text = (
+            bytes(header).decode("utf-8", "replace")
+            if isinstance(header, (bytes, bytearray))
+            else str(header)
+        )
+    else:
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+
     match = re.match(
         r'\((?P<flags>[^)]*)\)\s+(?:"[^"]*"|NIL)\s+(?P<name>.*)$',
         text.strip(),
@@ -195,12 +220,14 @@ def _parse_list_entry(raw: Any) -> str | None:
     flags = match.group("flags").lower()
     if "\\noselect" in flags or "\\nonexistent" in flags:
         return None
-    name = match.group("name").strip()
-    # A literal ({n}\r\n...) is only used for names with special characters; the
-    # trailing size marker is not part of the name.
-    name = re.sub(r"\{\d+\}$", "", name).strip()
-    if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
-        name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    if literal_name is not None:
+        name = literal_name.strip()
+    else:
+        name = match.group("name").strip()
+        # A literal size marker left in a plain line is not part of the name.
+        name = re.sub(r"\{\d+\}$", "", name).strip()
+        if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+            name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
     if not name:
         return None
     return _decode_modified_utf7(name)

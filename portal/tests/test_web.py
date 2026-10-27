@@ -422,6 +422,54 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("user@example.com", text)
         self.assertNotIn("secret-pw", text)
 
+    def test_provision_error_keeps_folder_selection(self) -> None:
+        self._make_invite()
+        self._enter()
+        csrf = self._csrf()
+        self.web.provisioner = RaisingProvisioner(
+            ProvisionError("授权码无效", field="password", code="imap_auth")
+        )
+        body = urlencode(
+            [
+                ("csrf", csrf),
+                ("email", "user@example.com"),
+                ("password", "bad"),
+                ("folders_used", "1"),
+                ("folders", "INBOX"),
+                ("folders", "已发送"),
+            ]
+        ).encode("utf-8")
+        status, _, data = self.client.request(
+            "POST",
+            "/provision",
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 400)
+        text = data.decode("utf-8")
+        self.assertIn('name="folders" value="INBOX" data-folder-preset', text)
+        self.assertIn('name="folders" value="已发送" data-folder-preset', text)
+
+    def test_provision_error_keeps_all_folders_mode(self) -> None:
+        self._make_invite()
+        self._enter()
+        csrf = self._csrf()
+        self.web.provisioner = RaisingProvisioner(
+            ProvisionError("容量已满", code="capacity")
+        )
+        status, _, data = self.client.post_form(
+            "/provision",
+            {
+                "csrf": csrf,
+                "email": "user@example.com",
+                "password": "bad",
+                "folders_mode": "all",
+            },
+        )
+        self.assertEqual(status, 429)
+        text = data.decode("utf-8")
+        self.assertIn('value="all" data-folder-mode-all checked', text)
+
     def test_instance_page_is_owner_only(self) -> None:
         self._make_invite()
         self._enter()
