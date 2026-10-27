@@ -573,6 +573,14 @@ class StatsCollector:
         container_stats: dict[str, Any] | None,
     ) -> dict[str, Any]:
         entry = empty_entry(instance)
+        if entry["configured"].get("source") == "deployment":
+            # "Deployment default" is only useful with the actual value:
+            # MSM_SYNC_FOLDERS can mean "every folder", which is a very
+            # different (and much more expensive) scope.
+            default = [
+                str(name) for name in (getattr(self.config, "sync_folders", ()) or ())
+            ]
+            entry["configured"] = {**entry["configured"], "default": default}
         if container:
             entry["container_state"] = str(container.get("State") or "")
             entry["container_status"] = str(container.get("Status") or "")

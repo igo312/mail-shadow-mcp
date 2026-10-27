@@ -641,7 +641,12 @@ def admin_instance_page(
     kind, label = _badge(entry)
     configured = entry.get("configured") or {}
     if configured.get("source") == "deployment":
-        scope = "部署默认（未单独选择）"
+        defaults = [str(name) for name in configured.get("default") or []]
+        scope = (
+            f"部署默认：{'、'.join(defaults)}"
+            if defaults
+            else "部署默认：全部文件夹"
+        )
     elif configured.get("all"):
         scope = "全部文件夹"
     else:
@@ -966,7 +971,12 @@ def _admin_row(entry: dict[str, Any], csrf: str) -> str:
     configured = entry.get("configured") or {}
     if configured.get("source") == "deployment":
         scope_main = "默认"
-        scope_names = "部署默认范围"
+        defaults = [str(name) for name in configured.get("default") or []]
+        scope_names = (
+            "、".join(defaults[:3]) + ("（部署默认）" if defaults else "")
+            if defaults
+            else "全部文件夹（部署默认）"
+        )
         scope_count: int | None = None
     elif configured.get("all"):
         scope_main = "全部"
