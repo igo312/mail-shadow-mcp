@@ -197,6 +197,141 @@ func syncAccount(accCfg config.AccountConfig, db *sql.DB) error {
 	return nil
 }
 
+// pendingBackfillFolders lists the folders that still need CJK indexing,
+// restricted to accounts the process is currently configured for.
+func pendingBackfillFolders(db *sql.DB, cfg *config.Config) map[string][]string {
+	rows, err := db.Query(
+		`SELECT account_id, imap_folder FROM sync_state
+		  WHERE cjk_backfill_done = 0 ORDER BY account_id, imap_folder`,
+	)
+	if err != nil {
+		slog.Warn("could not list folders for CJK backfill", "err", err)
+		return nil
+	}
+	defer rows.Close()
+
+	configured := make(map[string]struct{}, len(cfg.Accounts))
+	for _, acc := range cfg.Accounts {
+		configured[acc.ID] = struct{}{}
+	}
+	pending := make(map[string][]string)
+	for rows.Next() {
+		var accountID, folder string
+		if err := rows.Scan(&accountID, &folder); err != nil {
+			slog.Warn("could not read folder for CJK backfill", "err", err)
+			return pending
+		}
+		if _, ok := configured[accountID]; !ok {
+			continue
+		}
+		pending[accountID] = append(pending[accountID], folder)
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("could not list folders for CJK backfill", "err", err)
+	}
+	return pending
+}
+
+// backfillPendingOnce indexes every folder listed in sync_state as pending,
+// including folders that are no longer in the account's selection.  Their mail
+// stays searchable, and indexing it is a database-only operation.
+//
+// It returns true when at least one folder was attempted.  Each call is
+// bounded by backfillPassBudget inside backfillCJK so it cannot hold a folder
+// lock (or the SQLite writer) indefinitely.
+func backfillPendingOnce(cfg *config.Config, db *sql.DB, logger *slog.Logger) bool {
+	pending := pendingBackfillFolders(db, cfg)
+	if len(pending) == 0 {
+		return false
+	}
+	attempted := false
+	for _, acc := range cfg.Accounts {
+		folders := pending[acc.ID]
+		if len(folders) == 0 {
+			continue
+		}
+		client := &Client{cfg: acc}
+		for _, folder := range folders {
+			fmu := folderMutex(acc.ID, folder)
+			if !fmu.TryLock() {
+				continue
+			}
+			attempted = true
+			err := client.backfillCJK(db, logger.With("account", acc.ID, "folder", folder), folder)
+			fmu.Unlock()
+			if err != nil {
+				logger.Warn("CJK backfill pass failed",
+					"account", acc.ID, "folder", folder, "err", err)
+			}
+		}
+	}
+	return attempted
+}
+
+// RunCJKBackfill continuously drains the CJK backfill queue with short,
+// bounded passes.  A folder sync only gets a 3-second slice, which is right
+// for latency but far too little for a 400k-message mailbox if it were only
+// driven by the sync interval (15-30 minutes).  This worker keeps making
+// progress in the background while the regular sync loop stays responsive.
+func RunCJKBackfill(cfg *config.Config, db *sql.DB) {
+	logger := slog.With("component", "cjk-backfill")
+	for {
+		before := backfillCursorSum(db)
+		if !backfillPendingOnce(cfg, db, logger) {
+			time.Sleep(30 * time.Second)
+			continue
+		}
+		if backfillCursorSum(db) == before {
+			// No cursor moved: a batch is failing (or every folder was
+			// locked by a sync).  Back off instead of retrying in a tight
+			// loop and flooding the log.
+			time.Sleep(30 * time.Second)
+			continue
+		}
+		// Leave the writer to sync and MCP queries between passes.
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// DrainCJKBackfill finishes the backfill queue synchronously.  It is used by
+// the one-shot "sync" command, where there is no server process to keep the
+// background worker alive.  It stops after a few passes without cursor
+// progress so a permanently failing message cannot hang the command.
+func DrainCJKBackfill(cfg *config.Config, db *sql.DB) {
+	logger := slog.With("component", "cjk-backfill")
+	stalls := 0
+	for {
+		if len(pendingBackfillFolders(db, cfg)) == 0 {
+			return
+		}
+		before := backfillCursorSum(db)
+		if !backfillPendingOnce(cfg, db, logger) {
+			return
+		}
+		after := backfillCursorSum(db)
+		if after == before {
+			stalls++
+			if stalls >= 3 {
+				logger.Warn("CJK backfill made no progress; leaving it to the next run")
+				return
+			}
+		} else {
+			stalls = 0
+		}
+	}
+}
+
+func backfillCursorSum(db *sql.DB) int64 {
+	var sum int64
+	if err := db.QueryRow(
+		`SELECT COALESCE(SUM(cjk_cursor_uid), 0) FROM sync_state
+		  WHERE cjk_backfill_done = 0`,
+	).Scan(&sum); err != nil {
+		return 0
+	}
+	return sum
+}
+
 // folderSyncAttempts is how often a folder sync is retried within a single run.
 // Each attempt resumes from the persisted last_uid, so an interrupted folder
 // costs at most one sync window of re-fetching.

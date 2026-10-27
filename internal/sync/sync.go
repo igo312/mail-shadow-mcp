@@ -872,25 +872,33 @@ func (c *Client) finishFolder(db *sql.DB, logger *slog.Logger, folder string) er
 	return nil
 }
 
+// Backfill tuning.  They are variables so tests can shrink the budget without
+// sleeping; production only reads them.
+var (
+	// 200 rows amortises the per-batch transaction and FTS overhead.
+	backfillBatchSize = 200
+	// A batch is also bounded by the body bytes it materialises.  200 rows at
+	// the 256 KB stored-body cap would be ~50 MB, which is far too much for a
+	// 128 MB container; 8 MB keeps peak memory predictable.
+	backfillBatchBytes = 8 << 20
+	// One pass must not hold the sync folder lock indefinitely.  The cursor is
+	// persisted per batch, so the next pass (or the next scheduled sync)
+	// resumes where this one stopped.  With the per-account folder loop this is
+	// the difference between "the backfill runs for minutes" and "the other
+	// folders sync on time".
+	backfillPassBudget = 3 * time.Second
+)
+
 // backfillCJK incrementally indexes messages that were imported before the
 // auxiliary CJK index existed.  It runs after every folder sync (including
-// "up to date" runs) and is resumable via mail_content.cjk_indexed.
+// "up to date" runs) and is resumable via sync_state.cjk_cursor_uid plus
+// mail_content.cjk_indexed.
+//
+// Each batch is atomic: rows are only marked indexed in the same transaction
+// that advances the cursor.  If any row fails, the transaction is rolled back
+// and the folder is *not* marked complete, so the next pass retries the same
+// rows instead of silently skipping them.
 func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) error {
-	const (
-		// 200 rows amortises the per-batch FTS scan and transaction.  At 25 rows
-		// the per-batch overhead dominated the entire backfill.
-		batchSize = 200
-		// Yield regularly so a long backfill cannot monopolise the single
-		// writer while MCP queries are being served.
-		yieldEvery = 25
-		yieldFor   = 20 * time.Millisecond
-	)
-	total := 0
-	batches := 0
-	// Keyset cursor on imap_uid, persisted in sync_state so the next pass (or a
-	// restart) resumes where this one stopped.  Re-reading it every pass is what
-	// keeps the work linear: the previous version restarted at the first UID and
-	// re-scanned every already indexed row.
 	var cursor uint32
 	var done int
 	if err := db.QueryRow(
@@ -908,7 +916,17 @@ func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) err
 		// amplification on large mailboxes).
 		return nil
 	}
-	startedFromZero := cursor == 0
+
+	// Legacy databases can contain one CJK index row per re-index attempt.
+	// Duplicates do not change search results (the query joins on entry_id),
+	// but they bloat the index, so remove them once per database.  This is
+	// deliberately independent of the cursor: a pass that resumes at UID X
+	// must still clean up rows left by earlier runs.
+	dedupeCJKIndexOnce(db, logger)
+
+	started := time.Now()
+	processed := 0
+	batches := 0
 	for {
 		rows, err := db.Query(`
 			SELECT e.id, e.subject, e.imap_uid, COALESCE(c.body_text, '')
@@ -918,7 +936,7 @@ func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) err
 			  AND e.imap_uid > ?
 			  AND (c.cjk_indexed IS NULL OR c.cjk_indexed = 0)
 			ORDER BY e.imap_uid
-			LIMIT ?`, c.cfg.ID, folder, cursor, batchSize)
+			LIMIT ?`, c.cfg.ID, folder, cursor, backfillBatchSize)
 		if err != nil {
 			return fmt.Errorf("backfillCJK: query: %w", err)
 		}
@@ -927,45 +945,48 @@ func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) err
 			uid               uint32
 		}
 		var items []item
+		batchBytes := 0
+		var scanErr error
 		for rows.Next() {
 			var it item
-			if err := rows.Scan(&it.id, &it.subject, &it.uid, &it.body); err == nil {
-				items = append(items, it)
+			if err := rows.Scan(&it.id, &it.subject, &it.uid, &it.body); err != nil {
+				// A scan error used to be skipped silently.  If every row in
+				// the batch failed to scan the old code saw an empty batch and
+				// marked the folder complete with those messages unindexed.
+				scanErr = err
+				break
 			}
+			// Stop adding rows once the batch is large enough.  Rows that do
+			// not fit are picked up by the next query (uid > nextCursor), so
+			// the byte budget never skips a message.
+			if len(items) > 0 && batchBytes+len(it.subject)+len(it.body) > backfillBatchBytes {
+				break
+			}
+			items = append(items, it)
+			batchBytes += len(it.subject) + len(it.body)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
 			return fmt.Errorf("backfillCJK: iterate: %w", err)
 		}
 		rows.Close()
+		if scanErr != nil {
+			return fmt.Errorf("backfillCJK: scan: %w", scanErr)
+		}
 		if len(items) == 0 {
 			// Nothing left in this folder: searches may now use the auxiliary
 			// index.  Until this flag is set, queries use the bounded substring
 			// fallback so they cannot silently omit unindexed older mail.
-			if startedFromZero {
-				// A database upgraded from a build that had mail_cjk_fts but no
-				// cjk_indexed column can already contain FTS rows for messages we
-				// just indexed again.  De-duplicate once per folder instead of
-				// deleting per batch: the per-batch delete had to scan the whole
-				// FTS table every time.
-				dedupeCJKIndex(db, logger)
-			}
 			markCJKBackfillDone(db, logger, c.cfg.ID, folder)
 			return nil
 		}
 
-		// Advance past this batch even when individual rows fail: they keep
-		// cjk_indexed = 0 and are retried on the next pass, while the cursor
-		// guarantees this pass cannot spin on the same rows forever.
 		nextCursor := items[len(items)-1].uid
 
 		tx, err := db.Begin()
 		if err != nil {
 			return fmt.Errorf("backfillCJK: begin tx: %w", err)
 		}
-		// One DELETE for the whole batch.  mail_cjk_fts.entry_id is UNINDEXED,
-		// so each of these statements scans the FTS table; doing it per row (as
-		// before) turned the backfill into one full FTS scan per message.
 		ins, err := tx.Prepare(`INSERT INTO mail_cjk_fts (entry_id, text) VALUES (?, ?)`)
 		if err != nil {
 			tx.Rollback()
@@ -988,17 +1009,30 @@ func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) err
 			tx.Rollback()
 			return fmt.Errorf("backfillCJK: prepare cursor: %w", err)
 		}
+
+		var batchErr error
 		for _, it := range items {
 			text := it.subject + "\n" + it.body
 			if maildb.HasCJK(text) {
 				if _, err := ins.Exec(it.id, maildb.CJKIndexText(text)); err != nil {
-					logger.Warn("backfillCJK: insert", "entry_id", it.id, "err", err)
-					continue
+					batchErr = fmt.Errorf("insert entry %s: %w", it.id, err)
+					break
 				}
 			}
 			if _, err := mark.Exec(it.id, it.body); err != nil {
-				logger.Warn("backfillCJK: mark indexed", "entry_id", it.id, "err", err)
+				batchErr = fmt.Errorf("mark entry %s: %w", it.id, err)
+				break
 			}
+		}
+		if batchErr != nil {
+			ins.Close()
+			mark.Close()
+			moveCursor.Close()
+			tx.Rollback()
+			// The cursor stays where it was, so the same batch is retried on
+			// the next pass.  The folder is not marked complete while any row
+			// is still unindexed.
+			return fmt.Errorf("backfillCJK: batch at uid %d: %w", items[0].uid, batchErr)
 		}
 		if _, err := moveCursor.Exec(nextCursor, c.cfg.ID, folder); err != nil {
 			ins.Close()
@@ -1014,27 +1048,71 @@ func (c *Client) backfillCJK(db *sql.DB, logger *slog.Logger, folder string) err
 			return fmt.Errorf("backfillCJK: commit: %w", err)
 		}
 		cursor = nextCursor
-		total += len(items)
+		processed += len(items)
 		batches++
-		if batches%yieldEvery == 0 {
-			time.Sleep(yieldFor)
+
+		if time.Since(started) >= backfillPassBudget {
+			// Yield back to the folder loop; the persisted cursor resumes the
+			// work on the next pass.
+			break
 		}
 	}
-	if total > 0 {
-		logger.Info("CJK index backfill progress", "processed", total)
+
+	if processed > 0 {
+		logger.Info("CJK index backfill progress",
+			"processed", processed,
+			"batches", batches,
+			"cursor", cursor,
+			"elapsed_ms", time.Since(started).Milliseconds(),
+			"budget_ms", backfillPassBudget.Milliseconds(),
+		)
 	}
 	return nil
 }
 
-// dedupeCJKIndex removes duplicate CJK index rows for the same message, keeping
-// the first rowid.  It runs once per folder, when a backfill starts from the
-// beginning, because only databases upgraded from a pre-cjk_indexed build can
-// contain duplicates.
-func dedupeCJKIndex(db *sql.DB, logger *slog.Logger) {
-	if _, err := db.Exec(`
+// dedupeCJKIndexOnce removes duplicate CJK index rows for the same message,
+// keeping the first rowid.  It runs at most once per database, tracked in
+// db_maintenance, because only databases upgraded from a pre-cjk_indexed build
+// can contain duplicates.  Running it per folder (and only when the cursor
+// happened to start at zero) both rescanned the whole index repeatedly and was
+// skipped after a restart that had already committed one batch.
+func dedupeCJKIndexOnce(db *sql.DB, logger *slog.Logger) {
+	const job = "cjk_dedupe_v1"
+
+	tx, err := db.Begin()
+	if err != nil {
+		logger.Warn("backfillCJK: could not begin de-duplication", "err", err)
+		return
+	}
+	var applied int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM db_maintenance WHERE name = ?`, job,
+	).Scan(&applied); err != nil {
+		tx.Rollback()
+		logger.Warn("backfillCJK: could not read de-duplication state", "err", err)
+		return
+	}
+	if applied > 0 {
+		tx.Rollback()
+		return
+	}
+	if _, err := tx.Exec(`
 		DELETE FROM mail_cjk_fts
 		 WHERE rowid NOT IN (SELECT MIN(rowid) FROM mail_cjk_fts GROUP BY entry_id)`); err != nil {
+		tx.Rollback()
 		logger.Warn("backfillCJK: could not de-duplicate CJK index", "err", err)
+		return
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO db_maintenance (name, applied_at) VALUES (?, ?)`,
+		job, time.Now().UTC().Format(time.RFC3339),
+	); err != nil {
+		tx.Rollback()
+		logger.Warn("backfillCJK: could not record de-duplication", "err", err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		logger.Warn("backfillCJK: could not commit de-duplication", "err", err)
 	}
 }
 

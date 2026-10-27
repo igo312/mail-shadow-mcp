@@ -73,5 +73,12 @@ func cmdSync(args []string) {
 			slog.Info("sync ok", "account", r.AccountID)
 		}
 	}
+	// The folder sync only gives the CJK backfill a short slice.  A one-shot
+	// run has no server process to continue the work, so finish the queue here
+	// before exiting.  A permanently failing message cannot hang the command:
+	// DrainCJKBackfill gives up after repeated passes without progress.
+	if exitCode == 0 {
+		imapsync.DrainCJKBackfill(cfg, database)
+	}
 	os.Exit(exitCode)
 }

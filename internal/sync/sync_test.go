@@ -595,3 +595,214 @@ func TestIndexNewMessage_CapsStoredBody(t *testing.T) {
 		t.Errorf("stored body length = %d, want %d", stored, maxStoredBodyBytes)
 	}
 }
+
+// insertBackfillRow adds one message and an unindexed mail_content row.
+func insertBackfillRow(t *testing.T, database *sql.DB, account, folder string, uid int, subject, body string) {
+	t.Helper()
+	id := fmt.Sprintf("%s:%s:%d", account, folder, uid)
+	if _, err := database.Exec(`INSERT INTO mail_entries
+		(id, account_id, imap_uid, imap_folder, subject, sender)
+		VALUES (?, ?, ?, ?, ?, 'a@b.c')`, id, account, uid, folder, subject); err != nil {
+		t.Fatalf("insert entry uid=%d: %v", uid, err)
+	}
+	if _, err := database.Exec(`INSERT INTO mail_content (entry_id, body_text, cjk_indexed)
+		VALUES (?, ?, 0)`, id, body); err != nil {
+		t.Fatalf("insert content uid=%d: %v", uid, err)
+	}
+	if _, err := database.Exec(`INSERT INTO sync_state (account_id, imap_folder)
+		VALUES (?, ?) ON CONFLICT(account_id, imap_folder) DO NOTHING`, account, folder); err != nil {
+		t.Fatalf("insert sync_state: %v", err)
+	}
+}
+
+func TestBackfillCJK_BatchFailureRollsBackAndRetries(t *testing.T) {
+	database := openTestDB(t)
+	const account, folder = "acc1", "INBOX"
+	insertBackfillRow(t, database, account, folder, 1, "关于财务的通知", "正文内容")
+	insertBackfillRow(t, database, account, folder, 2, "Weekly report", "plain body")
+
+	// Make marking the first row fail.  The whole batch must roll back: a
+	// partially committed batch would advance the cursor past the failure and
+	// the folder would later be marked complete with that mail unindexed.
+	if _, err := database.Exec(`CREATE TRIGGER fail_mark
+		BEFORE UPDATE ON mail_content
+		WHEN NEW.entry_id = 'acc1:INBOX:1'
+		BEGIN SELECT RAISE(ABORT, 'simulated write error'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	client := &Client{cfg: config.AccountConfig{ID: account}}
+	if err := client.backfillCJK(database, slog.Default(), folder); err == nil {
+		t.Fatal("expected the failing batch to return an error")
+	}
+
+	var done int
+	var cursor uint32
+	if err := database.QueryRow(
+		`SELECT cjk_backfill_done, cjk_cursor_uid FROM sync_state
+		  WHERE account_id = ? AND imap_folder = ?`, account, folder,
+	).Scan(&done, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	if done != 0 || cursor != 0 {
+		t.Fatalf("after failure done=%d cursor=%d, want 0 and 0", done, cursor)
+	}
+	var pending, cjkRows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM mail_content WHERE cjk_indexed = 0`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT COUNT(*) FROM mail_cjk_fts`).Scan(&cjkRows); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 2 || cjkRows != 0 {
+		t.Fatalf("after failure pending=%d cjk_rows=%d, want 2 and 0", pending, cjkRows)
+	}
+
+	if _, err := database.Exec(`DROP TRIGGER fail_mark`); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.backfillCJK(database, slog.Default(), folder); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if err := database.QueryRow(`SELECT cjk_backfill_done FROM sync_state
+		WHERE account_id = ? AND imap_folder = ?`, account, folder).Scan(&done); err != nil {
+		t.Fatal(err)
+	}
+	if done != 1 {
+		t.Fatalf("done=%d after successful retry, want 1", done)
+	}
+	if err := database.QueryRow(`SELECT COUNT(*) FROM mail_content WHERE cjk_indexed = 0`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Fatalf("pending=%d after successful retry, want 0", pending)
+	}
+}
+
+func TestBackfillCJK_DeduplicatesEvenWhenResuming(t *testing.T) {
+	database := openTestDB(t)
+	const account, folder = "acc1", "INBOX"
+	insertBackfillRow(t, database, account, folder, 1, "关于财务的通知", "正文内容")
+	insertBackfillRow(t, database, account, folder, 2, "另一封通知", "正文内容")
+
+	// State after a restart that already committed the first batch: the
+	// cursor is non-zero, so the old "started from zero" dedupe was skipped.
+	if _, err := database.Exec(`UPDATE mail_content SET cjk_indexed = 1
+		WHERE entry_id = 'acc1:INBOX:1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE sync_state SET cjk_cursor_uid = 1
+		WHERE account_id = ? AND imap_folder = ?`, account, folder); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := database.Exec(`INSERT INTO mail_cjk_fts (entry_id, text)
+			VALUES ('acc1:INBOX:1', '旧 邮 件')`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	client := &Client{cfg: config.AccountConfig{ID: account}}
+	if err := client.backfillCJK(database, slog.Default(), folder); err != nil {
+		t.Fatalf("backfillCJK: %v", err)
+	}
+
+	var duplicates, done int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM mail_cjk_fts
+		WHERE entry_id = 'acc1:INBOX:1'`).Scan(&duplicates); err != nil {
+		t.Fatal(err)
+	}
+	if duplicates != 1 {
+		t.Fatalf("legacy duplicates = %d, want 1", duplicates)
+	}
+	if err := database.QueryRow(`SELECT cjk_backfill_done FROM sync_state
+		WHERE account_id = ? AND imap_folder = ?`, account, folder).Scan(&done); err != nil {
+		t.Fatal(err)
+	}
+	if done != 1 {
+		t.Fatalf("done=%d, want 1", done)
+	}
+}
+
+func TestBackfillCJK_StopsAtPassBudgetAndResumes(t *testing.T) {
+	oldBudget := backfillPassBudget
+	backfillPassBudget = time.Nanosecond
+	t.Cleanup(func() { backfillPassBudget = oldBudget })
+
+	database := openTestDB(t)
+	const account, folder = "acc1", "INBOX"
+	for uid := 1; uid <= 250; uid++ {
+		insertBackfillRow(t, database, account, folder, uid, "plain", "body")
+	}
+
+	client := &Client{cfg: config.AccountConfig{ID: account}}
+	if err := client.backfillCJK(database, slog.Default(), folder); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	var pending, done int
+	var cursor uint32
+	if err := database.QueryRow(`SELECT COUNT(*) FROM mail_content WHERE cjk_indexed = 0`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT cjk_backfill_done, cjk_cursor_uid FROM sync_state
+		WHERE account_id = ? AND imap_folder = ?`, account, folder).Scan(&done, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 50 || done != 0 || cursor != 200 {
+		t.Fatalf("first pass pending=%d done=%d cursor=%d, want 50/0/200", pending, done, cursor)
+	}
+
+	// Each pass processes at least one batch and then yields; a later pass
+	// reaches the end and marks the folder complete.
+	for pass := 0; pass < 5; pass++ {
+		if err := client.backfillCJK(database, slog.Default(), folder); err != nil {
+			t.Fatalf("resume pass %d: %v", pass, err)
+		}
+		if err := database.QueryRow(`SELECT cjk_backfill_done FROM sync_state
+			WHERE account_id = ? AND imap_folder = ?`, account, folder).Scan(&done); err != nil {
+			t.Fatal(err)
+		}
+		if done == 1 {
+			break
+		}
+	}
+	if done != 1 {
+		t.Fatal("backfill never marked the folder complete")
+	}
+	if err := database.QueryRow(`SELECT COUNT(*) FROM mail_content WHERE cjk_indexed = 0`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Fatalf("pending=%d after resuming, want 0", pending)
+	}
+}
+
+func TestBackfillPendingOnceIndexesDeselectedFolder(t *testing.T) {
+	database := openTestDB(t)
+	const account = "acc1"
+	insertBackfillRow(t, database, account, "INBOX", 1, "通知", "正文")
+	insertBackfillRow(t, database, account, "Archive", 1, "归档通知", "旧正文")
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{ID: account}}}
+	if !backfillPendingOnce(cfg, database, slog.Default()) {
+		t.Fatal("backfillPendingOnce reported no work although both folders are pending")
+	}
+
+	var archiveDone, inboxDone, archiveIndexed int
+	if err := database.QueryRow(`SELECT cjk_backfill_done FROM sync_state
+		WHERE account_id = ? AND imap_folder = 'Archive'`, account).Scan(&archiveDone); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT cjk_backfill_done FROM sync_state
+		WHERE account_id = ? AND imap_folder = 'INBOX'`, account).Scan(&inboxDone); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT cjk_indexed FROM mail_content
+		WHERE entry_id = 'acc1:Archive:1'`).Scan(&archiveIndexed); err != nil {
+		t.Fatal(err)
+	}
+	if archiveDone != 1 || inboxDone != 1 || archiveIndexed != 1 {
+		t.Fatalf("Archive done=%d INBOX done=%d indexed=%d, want 1/1/1",
+			archiveDone, inboxDone, archiveIndexed)
+	}
+}

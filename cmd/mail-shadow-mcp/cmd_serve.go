@@ -178,6 +178,11 @@ func cmdServe(args []string) {
 	// IDLE accounts: persistent push-based sync (no-op if none configured).
 	go imapsync.RunIDLE(cfg, database)
 
+	// The sync loop only gives the CJK backfill a short slice per folder so a
+	// large mailbox cannot delay new-mail sync; this worker drains the rest in
+	// the background with the same bounded passes.
+	go imapsync.RunCJKBackfill(cfg, database)
+
 	dlServer := startFileServer(cfg)
 
 	mcpSrv := mcpserver.New(database, cfg, version, dlServer)
