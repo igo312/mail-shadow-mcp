@@ -81,10 +81,17 @@ func Open(path string) (*sql.DB, error) {
 		// assumed one connection; keep that guarantee for in-memory/test DBs.
 		db.SetMaxOpenConns(1)
 	} else {
-		// One writer + several readers. WAL gives readers a consistent snapshot
-		// while the sync engine is writing.
-		db.SetMaxOpenConns(2)
-		db.SetMaxIdleConns(2)
+		// One connection for everything.  WAL lets readers run concurrently with
+		// a writer, but this process has several writers (the periodic pass, the
+		// IDLE-triggered sync, the CJK backfill and retrySkipped).  With two
+		// connections those writers race each other: one holds the write lock
+		// while the other spends its whole busy_timeout waiting and then fails
+		// with SQLITE_BUSY, which showed up as a retry storm on every start.
+		// Serialising on one connection costs some read concurrency and removes
+		// the writer/writer deadlock (same guarantee the in-memory path already
+		// relied on).
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
 	}
 
 	if err := db.Ping(); err != nil {
@@ -180,6 +187,14 @@ func Migrate(db *sql.DB) error {
 			entry_id     TEXT PRIMARY KEY,
 			body_text    TEXT NOT NULL DEFAULT '',
 			cjk_indexed  INTEGER NOT NULL DEFAULT 0
+		)`,
+
+		// One-off database maintenance bookkeeping.  Each named job runs once
+		// per database; unlike sync_state it survives folder selection changes
+		// and does not depend on a backfill starting at UID 0.
+		`CREATE TABLE IF NOT EXISTS db_maintenance (
+			name       TEXT PRIMARY KEY,
+			applied_at TIMESTAMP NOT NULL
 		)`,
 
 		// Indexes
