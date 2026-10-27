@@ -468,6 +468,26 @@ class StatsCollector:
                 "error": self._snapshot["error"],
             }
 
+    def mark(self, instance_id: str, **changes: Any) -> None:
+        """Patch one cached entry so the UI reflects an admin action at once.
+
+        A full re-collection takes seconds (seven databases, one after
+        another); rendering the previous snapshot right after "stop" would
+        still say 运行中.
+        """
+        with self._lock:
+            entry = self._snapshot["instances"].get(str(instance_id))
+            if entry is None:
+                return
+            updated = dict(entry)
+            updated.update(changes)
+            self._snapshot["instances"][str(instance_id)] = updated
+
+    def forget(self, instance_id: str) -> None:
+        """Drop a removed instance from the cached snapshot."""
+        with self._lock:
+            self._snapshot["instances"].pop(str(instance_id), None)
+
     def _run(self) -> None:
         interval = max(30, int(getattr(self.config, "stats_interval_seconds", 300)))
         while not self._stop.is_set():

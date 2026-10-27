@@ -85,6 +85,14 @@ class FakeStats:
     def refresh(self) -> None:
         self.refreshes += 1
 
+    def mark(self, instance_id, **changes) -> None:
+        entry = self.data["instances"].get(instance_id)
+        if entry is not None:
+            entry.update(changes)
+
+    def forget(self, instance_id) -> None:
+        self.data["instances"].pop(instance_id, None)
+
 
 class FakeDocker:
     def __init__(self) -> None:
@@ -407,6 +415,13 @@ class AdminTest(unittest.TestCase):
         self.assertEqual(self.docker.calls, [("stop", f"msm-{INSTANCE_ID}")])
         self.assertEqual(self.db.get_instance(INSTANCE_ID)["status"], "stopped")
         self.assertGreaterEqual(self.stats.refreshes, 1)
+
+        # The cached snapshot is patched immediately, so the detail page does
+        # not keep saying 运行中 until the next collection finishes.
+        _, _, data = self.client.get(f"/admin/instance/{INSTANCE_ID}")
+        text = data.decode("utf-8")
+        self.assertIn("已暂停", text)
+        self.assertNotIn("> 运行中<", text)
 
         status, _, _ = self.client.post_form(
             "/admin/action",

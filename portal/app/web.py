@@ -938,6 +938,7 @@ class WebApp:
                 detail={"instance_id": instance["id"], "by": "admin"},
             )
             if self.stats is not None:
+                self.stats.forget(instance["id"])
                 self.stats.refresh()
             self._back(handler, "/admin", f"已删除 {email} 的容器与数据卷。", "ok")
             return
@@ -951,6 +952,13 @@ class WebApp:
                     "running" if running else "failed",
                     error=None if running else "容器启动后未能运行，请查看日志",
                 )
+                self._mark_instance(
+                    instance["id"],
+                    status="running" if running else "failed",
+                    container_state="running" if running else "exited",
+                    container_status="刚启动" if running else "启动失败",
+                    log_error="",
+                )
                 message = (
                     "实例已启动，开始补同步。"
                     if running
@@ -960,11 +968,27 @@ class WebApp:
             elif action == "stop":
                 self.docker.stop_container(name)
                 self.db.set_instance_status(instance["id"], "stopped", error=None)
+                self._mark_instance(
+                    instance["id"],
+                    status="stopped",
+                    container_state="exited",
+                    container_status="已停止（管理员操作）",
+                    cpu_percent=0.0,
+                    mem_bytes=0,
+                    net_rx=0,
+                    net_tx=0,
+                )
                 message = "实例已暂停：容器已停止，MCP 请求会被拒绝，数据保留。"
                 kind = "ok"
             else:
                 self.docker.restart_container(name)
                 self.db.set_instance_status(instance["id"], "running", error=None)
+                self._mark_instance(
+                    instance["id"],
+                    status="running",
+                    container_state="running",
+                    container_status="刚重启",
+                )
                 message = "容器已重启，几秒后重新就绪。"
                 kind = "ok"
         except Exception as exc:
@@ -1026,6 +1050,15 @@ class WebApp:
         if self.stats is None:
             return {"generated_at": 0, "instances": {}, "host": {}, "error": ""}
         return self.stats.snapshot()
+
+    def _mark_instance(self, instance_id: str, **changes: Any) -> None:
+        """Keep the cached snapshot in step with an action we just performed."""
+        if self.stats is None:
+            return
+        try:
+            self.stats.mark(str(instance_id), **changes)
+        except Exception:  # pragma: no cover - stats must not break an action
+            log.exception("could not patch the stats snapshot")
 
     def _back(
         self,
