@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS invites (
@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS instances (
     provider_key   TEXT NOT NULL DEFAULT '',
     provider_name  TEXT NOT NULL DEFAULT '',
     owner_invite   TEXT NOT NULL DEFAULT '',
+    folders        TEXT,
     status         TEXT NOT NULL,
     last_error     TEXT,
     created_at     INTEGER NOT NULL,
@@ -104,6 +105,11 @@ class Database:
                 self._conn.execute(
                     "ALTER TABLE instances ADD COLUMN owner_invite TEXT NOT NULL DEFAULT ''"
                 )
+            if "folders" not in columns:
+                # NULL  -> use the deployment default (MSM_SYNC_FOLDERS)
+                # "[]"  -> sync every folder
+                # '["INBOX", ...]' -> explicit per-instance selection
+                self._conn.execute("ALTER TABLE instances ADD COLUMN folders TEXT")
             current = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if current < SCHEMA_VERSION:
                 self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -256,6 +262,7 @@ class Database:
         "provider_key",
         "provider_name",
         "owner_invite",
+        "folders",
         "status",
         "last_error",
         "created_at",
@@ -388,6 +395,20 @@ class Database:
                 (token_hash, now(), instance_id),
             )
 
+    def set_instance_folders(self, instance_id: str, folders_json: str | None) -> None:
+        """Store the per-instance folder selection.
+
+        ``None`` keeps the deployment default (MSM_SYNC_FOLDERS), ``"[]"`` means
+        every folder, and a JSON array restricts the sync engine to those
+        folders.  The MCP token is unaffected, so re-selecting folders never
+        invalidates a client configuration.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE instances SET folders = ?, updated_at = ? WHERE id = ?",
+                (folders_json, now(), instance_id),
+            )
+
     def set_instance_host_port(self, instance_id: str, host_port: int) -> None:
         with self._lock:
             self._conn.execute(
@@ -407,7 +428,7 @@ class Database:
             rows = self._conn.execute(
                 """SELECT id, email, container_name, config_volume, data_volume,
                           host_port, imap_host, status, last_error, created_at, updated_at,
-                          last_seen_at
+                          last_seen_at, folders
                    FROM instances ORDER BY created_at DESC"""
             ).fetchall()
         return [dict(row) for row in rows]

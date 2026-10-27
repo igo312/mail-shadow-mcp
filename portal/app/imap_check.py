@@ -8,7 +8,9 @@ the app password can be used by mail-shadow-mcp's sync engine.
 
 from __future__ import annotations
 
+import base64
 import imaplib
+import re
 import socket
 import ssl
 from typing import Any
@@ -58,10 +60,25 @@ def _sanitize(message: str, password: str) -> str:
     return text[:240]
 
 
-def check_login(settings: ImapSettings, password: str, *, timeout: float = 15.0) -> None:
-    """Raise ImapAuthError/ImapUnreachable if the credentials do not work."""
+def _close_quietly(client: imaplib.IMAP4 | None) -> None:
+    if client is None:
+        return
+    try:
+        client.logout()
+    except (imaplib.IMAP4.error, imaplib.IMAP4.abort, OSError, AttributeError):
+        pass
+
+
+def _open(settings: ImapSettings, password: str, *, timeout: float) -> imaplib.IMAP4:
+    """Connect, identify and authenticate.
+
+    Returns a logged-in client that the caller must close.  Errors are mapped to
+    ImapAuthError / ImapUnreachable so the web layer can show a sanitised
+    message instead of a raw traceback.
+    """
     context = ssl.create_default_context()
     client: imaplib.IMAP4 | None = None
+    ok = False
     try:
         if settings.tls_mode == "tls":
             client = imaplib.IMAP4_SSL(
@@ -97,6 +114,8 @@ def check_login(settings: ImapSettings, password: str, *, timeout: float = 15.0)
                 raise ImapAuthError(
                     "IMAP 认证失败：" + _sanitize(str(second_error), password)
                 ) from second_error
+        ok = True
+        return client
     except ImapError:
         raise
     except ssl.SSLError as exc:
@@ -116,11 +135,96 @@ def check_login(settings: ImapSettings, password: str, *, timeout: float = 15.0)
     except (imaplib.IMAP4.error, imaplib.IMAP4.abort) as exc:
         raise ImapAuthError("IMAP 服务器返回错误：" + _sanitize(str(exc), password)) from exc
     finally:
-        if client is not None:
+        if not ok:
+            _close_quietly(client)
+
+
+def check_login(settings: ImapSettings, password: str, *, timeout: float = 15.0) -> None:
+    """Raise ImapAuthError/ImapUnreachable if the credentials do not work."""
+    client = _open(settings, password, timeout=timeout)
+    _close_quietly(client)
+
+
+# ---------------------------------------------------------------------------
+# Folder listing (used by the web UI so users can pick what to sync)
+# ---------------------------------------------------------------------------
+def _decode_modified_utf7(value: str) -> str:
+    """Decode an IMAP folder name (RFC 3501 modified UTF-7) to normal Unicode.
+
+    Aliyun/163/QQ return folder names like ``&XfJT0ZAB-`` for Chinese mailboxes;
+    the sync engine and the YAML config use the decoded UTF-8 form.
+    """
+    if "&" not in value:
+        return value
+    out: list[str] = []
+    i = 0
+    while i < len(value):
+        char = value[i]
+        if char != "&":
+            out.append(char)
+            i += 1
+            continue
+        end = value.find("-", i)
+        if end == -1:
+            out.append(value[i:])
+            break
+        chunk = value[i + 1 : end]
+        if chunk == "":
+            out.append("&")
+        else:
             try:
-                client.logout()
-            except (imaplib.IMAP4.error, imaplib.IMAP4.abort, OSError, AttributeError):
-                pass
+                padded = chunk.replace(",", "/")
+                padded += "=" * (-len(padded) % 4)
+                out.append(base64.b64decode(padded).decode("utf-16-be"))
+            except (ValueError, UnicodeDecodeError):
+                out.append(value[i : end + 1])
+        i = end + 1
+    return "".join(out)
+
+
+def _parse_list_entry(raw: Any) -> str | None:
+    """Parse one ``LIST`` response line into a folder name."""
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    match = re.match(
+        r'\((?P<flags>[^)]*)\)\s+(?:"[^"]*"|NIL)\s+(?P<name>.*)$',
+        text.strip(),
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    flags = match.group("flags").lower()
+    if "\\noselect" in flags or "\\nonexistent" in flags:
+        return None
+    name = match.group("name").strip()
+    # A literal ({n}\r\n...) is only used for names with special characters; the
+    # trailing size marker is not part of the name.
+    name = re.sub(r"\{\d+\}$", "", name).strip()
+    if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+        name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    if not name:
+        return None
+    return _decode_modified_utf7(name)
+
+
+def list_folders(settings: ImapSettings, password: str, *, timeout: float = 20.0) -> list[str]:
+    """Return every selectable mailbox folder, INBOX first."""
+    client = _open(settings, password, timeout=timeout)
+    names: list[str] = []
+    try:
+        typ, data = client.list()
+        if typ != "OK":
+            raise ImapError("IMAP 服务器拒绝列出文件夹：" + _sanitize(str(data), password))
+        seen: set[str] = set()
+        for raw in data or []:
+            name = _parse_list_entry(raw)
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+    except (imaplib.IMAP4.error, imaplib.IMAP4.abort) as exc:
+        raise ImapError("IMAP 列出文件夹失败：" + _sanitize(str(exc), password)) from exc
+    finally:
+        _close_quietly(client)
+    return sorted(names, key=lambda name: (name.upper() != "INBOX", name.casefold()))
 
 
 def probe_result(settings: ImapSettings, password: str) -> dict[str, Any]:

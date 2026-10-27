@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,12 +15,17 @@ from . import templates
 from .config import Config
 from .db import Database
 from .gateway import Gateway
-from .provisioner import ProvisionError, Provisioner
+from .provisioner import (
+    ProvisionError,
+    Provisioner,
+    folders_from_instance,
+)
+from .providers import normalize_email
 from .security import CookieError, RateLimiter, TokenService, constant_time_equal
 
 log = logging.getLogger(__name__)
 
-MAX_FORM_BYTES = 16 * 1024
+MAX_FORM_BYTES = 64 * 1024
 SESSION_COOKIE = "msm_session"
 FLASH_COOKIE = "msm_flash"
 
@@ -141,6 +147,9 @@ class WebApp:
                     self._provision_submit(handler)
                 else:
                     self._empty(handler, 405, allow="GET, POST")
+                return
+            if path == "/folders" and handler.command == "POST":
+                self._folders(handler)
                 return
             if path.startswith("/instance/") and handler.command == "GET":
                 self._instance(handler, path[len("/instance/") :])
@@ -268,7 +277,8 @@ class WebApp:
             self._render_provision_error(handler, session, cookie, "请求来源无效，请用浏览器直接打开本页后重试。", 403)
             return
         try:
-            form = _read_form(handler)
+            form_all = _read_form_values(handler)
+            form = {key: values[-1] for key, values in form_all.items()}
         except ValueError:
             self._render_provision_error(handler, session, cookie, "表单数据无效，请刷新后重试。", 400)
             return
@@ -283,6 +293,33 @@ class WebApp:
         tls_mode = (form.get("tls_mode") or "tls").strip()
         provider_key = (form.get("provider") or "auto").strip()
 
+        # Three states: the picker was never used (None -> deployment default),
+        # "sync everything" ([]), or an explicit selection.
+        folders_mode = (form.get("folders_mode") or "").strip()
+        picked = [name for name in form_all.get("folders", []) if name.strip()]
+        if folders_mode == "all":
+            selected_folders: list[str] | None = []
+        elif form.get("folders_used") == "1":
+            if not picked:
+                self._render_provision_error(
+                    handler,
+                    session,
+                    cookie,
+                    "请至少选择一个要同步的文件夹，或选择「同步全部文件夹」。",
+                    400,
+                    field="folders",
+                    email=email,
+                    host=host,
+                    port=port,
+                    tls_mode=tls_mode,
+                    provider_key=provider_key,
+                    selected_folders=picked,
+                )
+                return
+            selected_folders = picked
+        else:
+            selected_folders = None
+
         try:
             result = self.provisioner.provision(
                 email,
@@ -293,6 +330,7 @@ class WebApp:
                 provider_key=provider_key,
                 invite_id=session["invite"],
                 ip=ip,
+                folders=selected_folders,
             )
         except ProvisionError as exc:
             status = {
@@ -341,6 +379,94 @@ class WebApp:
             cookies=[(FLASH_COOKIE, flash, self.config.flash_ttl_seconds, "Lax")],
         )
 
+    def _folders(self, handler: BaseHTTPRequestHandler) -> None:
+        """Return the mailbox folder list for the picker (JSON)."""
+        session, cookie = self._session(handler)
+        if not session:
+            self._json(handler, 401, {"ok": False, "error": "会话已过期，请刷新页面后重试。"})
+            return
+        ip = _client_ip(handler, self.config)
+        decision = self.limiter.check(
+            f"folders:{ip}",
+            self.config.folders_rate_limit,
+            self.config.folders_rate_window,
+        )
+        if not decision.allowed:
+            self._json(
+                handler,
+                429,
+                {
+                    "ok": False,
+                    "error": f"请求过于频繁，请在 {decision.retry_after} 秒后重试。",
+                },
+            )
+            return
+        if not self._origin_ok(handler):
+            self._json(handler, 403, {"ok": False, "error": "请求来源无效，请刷新页面后重试。"})
+            return
+        try:
+            form = _read_form(handler)
+        except ValueError:
+            self._json(handler, 400, {"ok": False, "error": "表单数据无效，请刷新后重试。"})
+            return
+        if not self.tokens.verify_csrf(cookie, form.get("csrf") or ""):
+            self._json(handler, 400, {"ok": False, "error": "页面已过期，请刷新页面后重试。"})
+            return
+
+        started = time.monotonic()
+        try:
+            folders = self.provisioner.list_mailbox_folders(
+                (form.get("email") or "").strip(),
+                form.get("password") or "",
+                host=(form.get("host") or "").strip(),
+                port=(form.get("port") or "").strip(),
+                tls_mode=(form.get("tls_mode") or "tls").strip(),
+                provider_key=(form.get("provider") or "auto").strip(),
+            )
+        except ProvisionError as exc:
+            self.db.audit(
+                "folders_error",
+                ip=ip,
+                email=(form.get("email") or "").strip() or None,
+                detail={"code": exc.code, "message": exc.message},
+            )
+            self._json(
+                handler,
+                400,
+                {"ok": False, "error": exc.message, "field": exc.field, "hint": exc.hint},
+            )
+            return
+
+        self._json(
+            handler,
+            200,
+            {
+                "ok": True,
+                "folders": folders,
+                "count": len(folders),
+                "current": self._current_folder_selection(
+                    form.get("email") or "", session
+                ),
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+            },
+        )
+
+    def _current_folder_selection(
+        self, email: str, session: dict[str, Any]
+    ) -> list[str] | None:
+        """Existing selection for this mailbox, but only for its owner session."""
+        if not email:
+            return None
+        try:
+            instance = self.db.get_instance_by_email(normalize_email(email))
+        except Exception:
+            return None
+        if not instance:
+            return None
+        if str(instance.get("owner_invite") or "") != str(session.get("invite") or ""):
+            return None
+        return folders_from_instance(instance)
+
     def _render_provision_error(
         self,
         handler: BaseHTTPRequestHandler,
@@ -356,6 +482,7 @@ class WebApp:
         port: str = "",
         tls_mode: str = "tls",
         provider_key: str = "auto",
+        selected_folders: list[str] | None = None,
     ) -> None:
         self._html(
             handler,
@@ -370,6 +497,7 @@ class WebApp:
                 error=message,
                 field=field,
                 hint=hint,
+                selected_folders=selected_folders,
             ),
         )
 
@@ -651,7 +779,8 @@ def _client_ip(handler: BaseHTTPRequestHandler, config: Config) -> str:
     return str(handler.client_address[0]) if handler.client_address else "unknown"
 
 
-def _read_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
+def _read_form_values(handler: BaseHTTPRequestHandler) -> dict[str, list[str]]:
+    """Parse the URL-encoded body once, keeping every repeated field."""
     length_text = handler.headers.get("Content-Length")
     if not length_text:
         raise ValueError("missing content length")
@@ -666,5 +795,8 @@ def _read_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
         decoded = body.decode("utf-8")
     except UnicodeDecodeError:
         decoded = body.decode("utf-8", "replace")
-    parsed = parse_qs(decoded, keep_blank_values=True, max_num_fields=50)
-    return {key: values[-1] for key, values in parsed.items()}
+    return parse_qs(decoded, keep_blank_values=True, max_num_fields=400)
+
+
+def _read_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
+    return {key: values[-1] for key, values in _read_form_values(handler).items()}

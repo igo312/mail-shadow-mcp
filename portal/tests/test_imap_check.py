@@ -5,14 +5,28 @@ import socket
 import threading
 import unittest
 
-from app.imap_check import ImapAuthError, ImapUnreachable, check_login
+from app.imap_check import (
+    ImapAuthError,
+    ImapUnreachable,
+    _decode_modified_utf7,
+    _parse_list_entry,
+    check_login,
+    list_folders,
+)
 from app.providers import ImapSettings
 
 
 class FakeIMAPServer:
-    def __init__(self, *, auth_ok: bool = True, advertise_plain: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        auth_ok: bool = True,
+        advertise_plain: bool = False,
+        folders: list[str] | None = None,
+    ) -> None:
         self.auth_ok = auth_ok
         self.advertise_plain = advertise_plain
+        self.folders = folders
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind(("127.0.0.1", 0))
@@ -60,6 +74,10 @@ class FakeIMAPServer:
                         self._send(connection, f"{tag} OK AUTHENTICATE completed\r\n".encode())
                     else:
                         self._send(connection, f"{tag} NO [AUTHENTICATIONFAILED] invalid\r\n".encode())
+                elif command == "LIST":
+                    for entry in self.folders or ['(\\HasNoChildren) "/" "INBOX"']:
+                        self._send(connection, f"* LIST {entry}\r\n".encode())
+                    self._send(connection, f"{tag} OK LIST completed\r\n".encode())
                 elif command == "LOGOUT":
                     self._send(connection, f"* BYE\r\n{tag} OK LOGOUT completed\r\n".encode())
                     break
@@ -169,6 +187,46 @@ class ImapCheckTest(unittest.TestCase):
         probe.close()
         with self.assertRaises(ImapUnreachable):
             check_login(settings(port), "app-password", timeout=1)
+
+
+class ListFoldersTest(unittest.TestCase):
+    def test_decodes_modified_utf7(self) -> None:
+        self.assertEqual(_decode_modified_utf7("&XfJT0ZAB-"), "已发送")
+        self.assertEqual(_decode_modified_utf7("INBOX"), "INBOX")
+        self.assertEqual(_decode_modified_utf7("A&-B"), "A&B")
+        self.assertEqual(_decode_modified_utf7("&ZeVnLIqe-"), "日本語")
+
+    def test_parses_list_entries(self) -> None:
+        self.assertEqual(
+            _parse_list_entry(b'(\\HasNoChildren) "/" "INBOX"'), "INBOX"
+        )
+        self.assertEqual(
+            _parse_list_entry(b'(\\HasNoChildren) "/" "&XfJT0ZAB-"'), "已发送"
+        )
+        self.assertIsNone(_parse_list_entry(b'(\\Noselect) "/" "Parent"'))
+        self.assertIsNone(_parse_list_entry(b"garbage"))
+
+    def test_list_folders_returns_inbox_first(self) -> None:
+        server = FakeIMAPServer(
+            folders=[
+                '(\\HasNoChildren) "/" "&XfJT0ZAB-"',
+                '(\\HasNoChildren) "/" "INBOX"',
+                '(\\HasNoChildren) "/" "Archive"',
+            ]
+        )
+        try:
+            names = list_folders(settings(server.port), "app-password", timeout=5)
+        finally:
+            server.close()
+        self.assertEqual(names, ["INBOX", "Archive", "已发送"])
+
+    def test_list_folders_auth_failure(self) -> None:
+        server = FakeIMAPServer(auth_ok=False)
+        try:
+            with self.assertRaises(ImapAuthError):
+                list_folders(settings(server.port), "wrong", timeout=5)
+        finally:
+            server.close()
 
 
 if __name__ == "__main__":

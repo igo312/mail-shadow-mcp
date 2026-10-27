@@ -141,7 +141,8 @@ portal ──Docker socket / CLI──▶ Docker
 
 1. 打开首页，输入邀请码。邀请码一次性写入 HttpOnly 会话 Cookie。
 2. 选择邮箱服务商（阿里企业邮箱需要手动选「阿里企业邮箱」），填写邮箱、IMAP 授权码；可展开高级设置填写自定义 IMAP host/port/TLS。
-3. portal 先用 `imaplib` 做一次只读登录验证：
+3. 可选：点「获取文件夹列表」，portal 用一次只读 IMAP 连接列出全部文件夹（阿里云 100+ 个文件夹约 0.2 秒），勾选要同步的文件夹。不点就沿用该实例当前设置（新实例用 `MSM_SYNC_FOLDERS`）。
+4. portal 先用 `imaplib` 做一次只读登录验证：
    - 支持 TLS / STARTTLS；
    - 对 163 / 126 先发送 RFC 2971 `ID`；
    - 优先 `LOGIN`，服务器只支持 `AUTH=PLAIN` 时自动回退；
@@ -152,7 +153,7 @@ portal ──Docker socket / CLI──▶ Docker
    - 创建 `msm-data-<id>` 卷；
    - 启动 `msm-<id>` 容器；`network` 模式加入 `msm-net`，`port` 模式发布一个 `127.0.0.1` 随机端口；
    - 等待容器内 `/mcp` 返回 401（说明 MCP handler 已就绪）。
-5. 返回结果页：MCP URL、Bearer Token、Claude/Cursor、Hermes、OpenClaw、cURL 四份配置。
+5. 返回结果页：MCP URL、Bearer Token、Claude/Cursor、Hermes、OpenClaw、cURL 四份配置，以及当前同步文件夹。
 
 ### “相同账户 + 相同授权码直接返回配置”
 
@@ -166,11 +167,25 @@ portal ──Docker socket / CLI──▶ Docker
   - 不会创建第二个容器；
   - 不会重新同步；
   - 直接返回同一份 token 和 MCP 配置。
+- **同一对 `(email, password)` + 不同的文件夹选择**：
+  - 视为改配置而不是改凭据：**token 不轮换**，已有 MCP 客户端保持可用；
+  - 重写 config 并重建容器（几秒内完成），数据卷不动；
+  - 结果页会提示「同步文件夹已更新，MCP Token 未变」。
 - 同一邮箱、不同授权码：
   - 先验证新授权码能登录；
   - 重写 config、重建容器、轮换 token 和 salt；
   - 旧 MCP 配置立即失效（这是修改授权码后的预期行为）。
 - 如果容器被 `docker rm` 了，再次提交同一凭据会从已有的数据卷重新建容器；如果实例被 `instance remove` 过，重建会轮换 token，旧配置不会复活。
+
+### 选择同步文件夹（大邮箱的性能开关）
+
+表单里的「同步哪些文件夹？」是可选的：
+
+- 点「获取文件夹列表」才会连一次 IMAP 并列出全部文件夹；阿里企业邮箱 108 个文件夹实测 **0.18 秒**（connect 0.04 + login 0.12 + LIST 0.02），所以按钮上的转圈只是防呆，正常一次眨眼就结束。
+- 不点就完全沿用原行为：新实例用 `MSM_SYNC_FOLDERS`，已存在实例保持原 config。
+- 勾选结果写进 `config.yaml` 的 `folders:`；只同步 3 个常用文件夹的 476k 封邮箱，一轮同步从 **19 分钟降到 30~60 秒**，MCP 查询也不再排队超时。
+- 服务器返回的是 RFC 3501 modified UTF-7 文件夹名（例如 `&XfJT0ZAB-`），portal 会解码成 `已发送` 再写进 YAML，和同步引擎看到的名称一致。
+- 同一邮箱 + 同一授权码重新提交并改文件夹：只重建容器、**不轮换 token**，客户端配置不用改。
 
 ### 阿里企业邮箱
 
@@ -510,6 +525,7 @@ docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}'
 | `MSM_FLASH_TTL` | `900` | 结果页 Token 显示窗口（秒） |
 | `MSM_INVITE_RATE_LIMIT` / `_WINDOW` | `12` / `900` | 每 IP 邀请码尝试限制 |
 | `MSM_PROVISION_RATE_LIMIT` / `_WINDOW` | `8` / `3600` | 每 IP 创建实例限制 |
+| `MSM_FOLDERS_RATE_LIMIT` / `_WINDOW` | `30` / `900` | 每 IP 调用「获取文件夹列表」的限制（每次都会登录一次 IMAP） |
 | `MSM_GATEWAY_RATE_LIMIT` / `_WINDOW` | `120` / `60` | 未知 token 的失败限制 |
 | `MSM_ALLOW_INSECURE_IMAP` | `0` | 是否允许 `tls_mode: none`；公网部署保持 0 |
 | `MSM_ALLOW_PRIVATE_IMAP` | `0` | 是否允许自定义 IMAP 指向内网/回环地址；公网部署保持 0 |

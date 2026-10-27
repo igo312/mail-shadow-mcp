@@ -127,9 +127,15 @@ def provision_page(
     field: str = "",
     hint: str = "",
     invite_remaining: str = "",
+    selected_folders: list[str] | None = None,
+    folders_all: bool = False,
 ) -> str:
     error_html = f'<div class="form-error" role="alert">{e(error)}</div>' if error else ""
     hint_html = f'<div class="form-hint">{e(hint)}</div>' if hint else ""
+    selected_hidden = "".join(
+        f'<input type="hidden" name="folders" value="{e(name)}" data-folder-preset>'
+        for name in (selected_folders or [])
+    )
 
     def invalid(name: str) -> str:
         return " input-invalid" if field == name else ""
@@ -212,6 +218,32 @@ def provision_page(
               </div>
             </div>
           </details>
+
+          <div class="folder-picker" data-folder-picker>
+            <div class="picker-head">
+              <span class="label">同步哪些文件夹？</span>
+              <button class="btn btn-ghost btn-small" type="button" data-folder-fetch>
+                <span class="btn-label">获取文件夹列表</span>
+                <span class="btn-spinner" aria-hidden="true"></span>
+              </button>
+            </div>
+            <p class="help">只勾选常用的几个：文件夹越多，首次同步越慢，AI 查询也越容易排队。不点「获取文件夹列表」就沿用当前设置。</p>
+            <div class="picker-status" data-folder-status role="status" aria-live="polite"></div>
+            <div class="picker-toolbar" data-folder-toolbar hidden>
+              <input class="input input-compact" type="search" data-folder-filter
+                     placeholder="筛选文件夹…" spellcheck="false" autocomplete="off">
+              <button class="btn btn-ghost btn-small" type="button" data-folder-all>全选</button>
+              <button class="btn btn-ghost btn-small" type="button" data-folder-none>清空</button>
+              <span class="picker-count" data-folder-count></span>
+            </div>
+            <div class="picker-list" data-folder-list hidden></div>
+            <label class="checkline">
+              <input type="checkbox" name="folders_mode" value="all" data-folder-mode-all{' checked' if folders_all else ''}>
+              <span>同步全部文件夹（大邮箱会很慢，不建议）</span>
+            </label>
+            <input type="hidden" name="folders_used" value="" data-folder-used>
+            {selected_hidden}
+          </div>
 
           <button class="btn btn-primary btn-wide" type="submit">
             <span class="btn-label">验证并创建实例</span>
@@ -328,6 +360,7 @@ def result_page(
         <code id="mcp-token">{e(token)}</code>
         <button class="btn btn-ghost btn-small copy-btn" type="button" data-copy="mcp-token">复制</button>
       </div>
+      <p class="fineprint">同步文件夹：{e(_folder_summary(instance))}　·　想调整？用同一邮箱和同一授权码重新提交，勾选新的文件夹即可；Token 不会变。</p>
 
       <div class="tabs" role="tablist">
         {''.join(tabs)}
@@ -375,6 +408,13 @@ def instance_status_page(
     </section>
     {note}
     {error}
+    <section class="card">
+      <div class="card-head">
+        <h2>同步范围</h2>
+        <p>当前同步：{e(_folder_summary(instance))}</p>
+      </div>
+      <p class="help">想修改？用同一个邮箱和同一授权码重新提交，在「同步哪些文件夹」里重新勾选即可。只改文件夹不会轮换 MCP Token，客户端配置不用动。</p>
+    </section>
     <section class="card">
       <div class="card-head">
         <h2>重新获取 MCP 配置</h2>
@@ -448,6 +488,28 @@ def _mask_email(email: str) -> str:
     else:
         masked_local = local[0] + "*" * (len(local) - 2) + local[-1]
     return f"{masked_local}@{domain}"
+
+
+def _folder_summary(instance: dict[str, Any]) -> str:
+    """Human readable description of the instance's sync scope."""
+    raw = instance.get("folders")
+    if raw in (None, ""):
+        return "部署默认（未单独选择）"
+    try:
+        folders = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return "部署默认（未单独选择）"
+    if not isinstance(folders, list):
+        return "部署默认（未单独选择）"
+    if not folders:
+        return "全部文件夹"
+    names = [str(name) for name in folders]
+    shown = "、".join(names[:6])
+    if len(names) > 6:
+        shown += f" 等 {len(names)} 个"
+    elif len(names) > 1:
+        shown += f"（{len(names)} 个）"
+    return shown
 
 
 def _config_snippets(token: str) -> list[tuple[str, str, str]]:

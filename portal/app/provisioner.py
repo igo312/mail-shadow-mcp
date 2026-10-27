@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import http.client
 import ipaddress
+import json
 import logging
 import secrets
 import socket
@@ -33,7 +34,7 @@ from .docker_cli import (
     container_spec_hash,
     instance_label,
 )
-from .imap_check import ImapError
+from .imap_check import ImapError, list_folders
 from .instance_config import parse_instance_config, render_instance_config
 from .providers import (
     ImapSettings,
@@ -81,6 +82,86 @@ class ReconcileResult:
     message: str = ""
 
 
+# Upper bound for a user-chosen folder list: a folder picker should never be
+# able to turn one config into a multi-megabyte YAML file.
+MAX_FOLDER_SELECTION = 300
+
+
+def folders_to_json(folders: list[str] | None) -> str | None:
+    """Serialise a selection for ``instances.folders`` (None = use default)."""
+    if folders is None:
+        return None
+    return json.dumps(list(folders), ensure_ascii=False)
+
+
+def folder_selection_changed(
+    requested: list[str], stored: list[str] | None
+) -> bool:
+    """True when the user's selection differs from what the instance syncs.
+
+    Order is irrelevant: the picker returns folders in the order the server
+    listed them, so re-submitting the same set in a different order must not
+    trigger a container rebuild (that used to look like a change and made the
+    form hang while the 25 GB instance restarted).
+    """
+    if stored is None:
+        # The instance still uses the deployment default (MSM_SYNC_FOLDERS);
+        # any explicit choice is a change.
+        return True
+    return sorted(requested) != sorted(stored)
+
+
+def folders_from_instance(instance: dict[str, Any] | None) -> list[str] | None:
+    """Read a stored selection: None = deployment default, [] = every folder."""
+    if not instance:
+        return None
+    raw = instance.get("folders")
+    if raw is None or raw == "":
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, list):
+        return None
+    return [str(item) for item in value]
+
+
+def normalize_folder_selection(raw: list[str] | None) -> list[str] | None:
+    """Validate and de-duplicate a folder list coming from the web form.
+
+    ``None`` means "no change / deployment default".  ``[]`` is preserved as
+    "sync every folder"; a non-empty list is the explicit selection.
+    """
+    if raw is None:
+        return None
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise ProvisionError(
+                "文件夹列表格式不正确。", field="folders", code="invalid_input"
+            )
+        name = item.strip()
+        if not name:
+            continue
+        if len(name) > 255:
+            raise ProvisionError(
+                "文件夹名称过长。", field="folders", code="invalid_input"
+            )
+        if name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+    if len(cleaned) > MAX_FOLDER_SELECTION:
+        raise ProvisionError(
+            f"一次最多选择 {MAX_FOLDER_SELECTION} 个文件夹。",
+            field="folders",
+            code="invalid_input",
+        )
+    return cleaned
+
+
 class Provisioner:
     def __init__(
         self,
@@ -96,6 +177,7 @@ class Provisioner:
         self.docker = docker
         self.tokens = tokens
         self._imap_check = imap_checker
+        self._list_folders = list_folders
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
@@ -111,7 +193,9 @@ class Provisioner:
         provider_key: str = "",
         invite_id: str = "",
         ip: str = "",
+        folders: list[str] | None = None,
     ) -> ProvisionResult:
+        folder_selection = normalize_folder_selection(folders)
         try:
             email = normalize_email(email_raw)
             password = normalize_password(password_raw)
@@ -150,6 +234,7 @@ class Provisioner:
                     new_salt=new_salt,
                     invite_id=invite_id,
                     ip=ip,
+                    folders=folder_selection,
                 )
                 # Transfer status-page ownership only *after* the credentials
                 # were accepted (idempotency hash match or a successful IMAP
@@ -186,7 +271,56 @@ class Provisioner:
                 token_salt=new_salt,
                 invite_id=invite_id,
                 ip=ip,
+                folders=folder_selection,
             )
+
+    def list_mailbox_folders(
+        self,
+        email_raw: str,
+        password_raw: str,
+        *,
+        host: str = "",
+        port: str | int | None = None,
+        tls_mode: str = "",
+        provider_key: str = "",
+    ) -> list[str]:
+        """Log in once and return the mailbox folder names for the picker.
+
+        The password is used for this single IMAP session only; nothing is
+        written to the control database.  The same SSRF/port checks as a real
+        provisioning request apply, so this cannot be used to probe internal
+        networks.
+        """
+        try:
+            email = normalize_email(email_raw)
+            password = normalize_password(password_raw)
+            settings = resolve_settings(
+                email,
+                host=host,
+                port=port,
+                tls_mode=tls_mode,
+                provider_key=provider_key,
+            )
+            password = prepare_password(email, password)
+        except InputError as exc:
+            raise ProvisionError(str(exc), field=exc.field, code="invalid_input") from exc
+
+        if settings.tls_mode == "none" and not self.config.allow_insecure_imap:
+            raise ProvisionError(
+                "为保护邮箱授权码，当前部署不允许使用未加密的 IMAP 连接。",
+                field="tls_mode",
+                code="insecure_imap",
+            )
+        self._validate_target(settings)
+        try:
+            return self._list_folders(settings, password)
+        except ImapError as exc:
+            raise ProvisionError(
+                str(exc),
+                field="password",
+                hint="请确认已开启 IMAP 服务，并使用邮箱生成的授权码/应用专用密码，而不是登录密码。",
+                code="imap_auth",
+            ) from exc
 
     def remove_instance(self, instance_id: str, *, purge_data: bool = False) -> dict[str, Any]:
         instance = self.db.get_instance(instance_id)
@@ -290,6 +424,7 @@ class Provisioner:
             sync_jitter_sec = int(parsed.get("sync_jitter_sec") or self.config.instance_sync_jitter_sec)
             tls_skip_verify = bool(parsed.get("tls_skip_verify"))
             if update_config:
+                stored_folders = folders_from_instance(instance)
                 new_config = render_instance_config(
                     email=str(instance["email"]),
                     settings=settings,
@@ -298,7 +433,9 @@ class Provisioner:
                     sync_interval_min=sync_interval_min,
                     sync_jitter_sec=sync_jitter_sec,
                     http_port=self.config.backend_port,
-                    folders=self.config.sync_folders,
+                    folders=self.config.sync_folders
+                    if stored_folders is None
+                    else stored_folders,
                     trash_folder=self.config.trash_folder,
                     tls_skip_verify=tls_skip_verify,
                 )
@@ -441,6 +578,7 @@ class Provisioner:
         new_salt: str,
         invite_id: str,
         ip: str,
+        folders: list[str] | None = None,
     ) -> ProvisionResult:
         same_credentials = constant_time_equal(existing["idem_hash"], idem_hash)
 
@@ -463,6 +601,44 @@ class Provisioner:
             token_hash = self.tokens.hash_mcp_token(token)
             same_token = constant_time_equal(existing["token_hash"], token_hash)
 
+            # Re-submitting the same credentials with a different folder
+            # selection is a *configuration* change, not a credential change:
+            # keep the token (existing MCP clients keep working), rewrite the
+            # config and restart the container so the sync engine picks the new
+            # folders up.
+            if folders is not None and folder_selection_changed(
+                folders, folders_from_instance(existing)
+            ):
+                # Changing the folder scope must not silently reset this
+                # instance's own sync interval / jitter / TLS settings; read them
+                # back from the config volume (the only stored copy).
+                preserved = self._read_existing_settings(existing)
+                self.db.set_instance_folders(existing["id"], folders_to_json(folders))
+                updated = self.db.get_instance(existing["id"]) or existing
+                self._recreate(
+                    updated,
+                    password=password,
+                    settings=settings,
+                    token=token,
+                    folders=folders,
+                    sync_interval_min=preserved["sync_interval_min"],
+                    sync_jitter_sec=preserved["sync_jitter_sec"],
+                    tls_skip_verify=preserved["tls_skip_verify"],
+                )
+                self.db.audit(
+                    "folders_updated",
+                    ip=ip,
+                    email=email,
+                    detail={"instance_id": existing["id"], "folders": folders},
+                )
+                return ProvisionResult(
+                    instance=self.db.get_instance(existing["id"]),
+                    token=token,
+                    reused=True,
+                    rotated=False,
+                    warning="同步文件夹已更新，容器已重启。MCP Token 未变，客户端配置不需要改。",
+                )
+
             # Master-key rotation (or an interrupted previous run) can leave the
             # stored token hash stale.  Rewriting the config and recreating the
             # container repairs it without asking the user for anything new.
@@ -484,7 +660,13 @@ class Provisioner:
                 )
                 instance = self.db.get_instance(existing["id"])
                 assert instance is not None
-                self._recreate(instance, password=password, settings=settings, token=token)
+                self._recreate(
+                    instance,
+                    password=password,
+                    settings=settings,
+                    token=token,
+                    folders=folders,
+                )
                 return ProvisionResult(
                     instance=self.db.get_instance(existing["id"]),
                     token=token,
@@ -499,6 +681,7 @@ class Provisioner:
                     password=password,
                     settings=settings,
                     token=token,
+                    folders=folders,
                 )
             except ProvisionError as exc:
                 self.db.set_instance_status(existing["id"], "failed", error=exc.message)
@@ -525,7 +708,16 @@ class Provisioner:
         )
         instance = self.db.get_instance(existing["id"])
         assert instance is not None
-        self._recreate(instance, password=password, settings=settings, token=token)
+        if folders is not None:
+            self.db.set_instance_folders(existing["id"], folders_to_json(folders))
+            instance = self.db.get_instance(existing["id"]) or instance
+        self._recreate(
+            instance,
+            password=password,
+            settings=settings,
+            token=token,
+            folders=folders,
+        )
         self.db.audit(
             "credentials_rotated",
             ip=ip,
@@ -549,6 +741,7 @@ class Provisioner:
         token_salt: str,
         invite_id: str,
         ip: str,
+        folders: list[str] | None = None,
     ) -> ProvisionResult:
         self._validate_imap(settings, password)
         token = self.tokens.derive_mcp_token(email, password, token_salt)
@@ -571,6 +764,7 @@ class Provisioner:
             "provider_key": settings.provider_key,
             "provider_name": settings.provider_name,
             "owner_invite": invite_id,
+            "folders": folders_to_json(folders),
             "status": "provisioning",
             "last_error": None,
             "created_at": now(),
@@ -586,7 +780,13 @@ class Provisioner:
         assert instance is not None
 
         try:
-            self._start(instance, password=password, settings=settings, token=token)
+            self._start(
+                instance,
+                password=password,
+                settings=settings,
+                token=token,
+                folders=folders,
+            )
         except ProvisionError as exc:
             self.db.set_instance_status(instance_id, "failed", error=exc.message)
             self._cleanup_failed_container(instance["container_name"])
@@ -730,6 +930,7 @@ class Provisioner:
         sync_jitter_sec: int = 0,
         tls_skip_verify: bool = False,
         write_config: bool = True,
+        folders: list[str] | None = None,
     ) -> None:
         if write_config:
             self._write_config(
@@ -740,6 +941,7 @@ class Provisioner:
                 sync_interval_min=sync_interval_min,
                 sync_jitter_sec=sync_jitter_sec,
                 tls_skip_verify=tls_skip_verify,
+                folders=folders,
             )
         self._remove_container_quietly(instance["container_name"])
         spec = self._container_spec(instance)
@@ -782,15 +984,54 @@ class Provisioner:
         password: str,
         settings: ImapSettings,
         token: str,
+        folders: list[str] | None = None,
+        sync_interval_min: int = 0,
+        sync_jitter_sec: int = 0,
+        tls_skip_verify: bool = False,
     ) -> None:
         self.db.set_instance_status(instance["id"], "updating", error=None)
         try:
-            self._start(instance, password=password, settings=settings, token=token)
+            self._start(
+                instance,
+                password=password,
+                settings=settings,
+                token=token,
+                folders=folders,
+                sync_interval_min=sync_interval_min,
+                sync_jitter_sec=sync_jitter_sec,
+                tls_skip_verify=tls_skip_verify,
+            )
         except ProvisionError as exc:
             self.db.set_instance_status(instance["id"], "failed", error=exc.message)
             self._cleanup_failed_container(instance["container_name"])
             self._cleanup_failed_config(instance["config_volume"])
             raise
+
+    def _read_existing_settings(self, instance: dict[str, Any]) -> dict[str, Any]:
+        """Best-effort read of per-instance settings back from the config volume.
+
+        A folder change rewrites config.yaml, so anything that is not passed
+        through would silently fall back to the deployment default.  When the
+        volume cannot be read the caller keeps the defaults, which is the same
+        behaviour as before this feature.
+        """
+        defaults = {"sync_interval_min": 0, "sync_jitter_sec": 0, "tls_skip_verify": False}
+        info = self.docker.inspect_container(instance["container_name"])
+        image = str((info or {}).get("Image") or "") or self.config.docker_image
+        try:
+            parsed = parse_instance_config(
+                self.docker.read_config_volume(instance["config_volume"], image)
+            )
+        except Exception:  # a folder change must not fail on a read error
+            log.debug(
+                "could not read existing config for %s", instance["id"], exc_info=True
+            )
+            return defaults
+        return {
+            "sync_interval_min": int(parsed.get("sync_interval_min") or 0),
+            "sync_jitter_sec": int(parsed.get("sync_jitter_sec") or 0),
+            "tls_skip_verify": bool(parsed.get("tls_skip_verify")),
+        }
 
     def _ensure_running(
         self,
@@ -799,8 +1040,20 @@ class Provisioner:
         password: str,
         settings: ImapSettings,
         token: str,
+        folders: list[str] | None = None,
     ) -> dict[str, Any]:
         name = instance["container_name"]
+
+        def restart() -> dict[str, Any]:
+            self._start(
+                instance,
+                password=password,
+                settings=settings,
+                token=token,
+                folders=folders,
+            )
+            return self.db.get_instance(instance["id"]) or instance
+
         info = self.docker.inspect_container(name)
         if info:
             state = info.get("State") or {}
@@ -817,8 +1070,7 @@ class Provisioner:
                         owner,
                         instance["id"],
                     )
-                    self._start(instance, password=password, settings=settings, token=token)
-                    return self.db.get_instance(instance["id"]) or instance
+                    return restart()
                 if self.config.backend_mode in {"network", "ip"}:
                     networks = (info.get("NetworkSettings") or {}).get("Networks") or {}
                     if self.config.docker_network not in networks:
@@ -827,8 +1079,7 @@ class Provisioner:
                             name,
                             self.config.docker_network,
                         )
-                        self._start(instance, password=password, settings=settings, token=token)
-                        return self.db.get_instance(instance["id"]) or instance
+                        return restart()
                 if self.config.backend_mode == "port":
                     host_port = self.docker.container_host_port(
                         name, self.config.backend_port
@@ -837,8 +1088,7 @@ class Provisioner:
                         # The container was created in network/ip mode (or its
                         # mapping was removed): recreate it with a loopback
                         # publish so the gateway can reach it.
-                        self._start(instance, password=password, settings=settings, token=token)
-                        return self.db.get_instance(instance["id"]) or instance
+                        return restart()
                     if int(instance.get("host_port") or 0) != host_port:
                         self.db.set_instance_host_port(instance["id"], host_port)
                     instance = self.db.get_instance(instance["id"]) or instance
@@ -846,8 +1096,7 @@ class Provisioner:
             if self.config.backend_mode == "port" and not (
                 self.docker.container_host_port(name, self.config.backend_port) or 0
             ):
-                self._start(instance, password=password, settings=settings, token=token)
-                return self.db.get_instance(instance["id"]) or instance
+                return restart()
             try:
                 self.docker.start_container(name)
             except DockerError as exc:
@@ -873,8 +1122,7 @@ class Provisioner:
         # Container disappeared (host cleanup, manual docker rm, ...).  The
         # config and data volumes may still exist, so recreate from the
         # credentials supplied by the user right now.
-        self._start(instance, password=password, settings=settings, token=token)
-        return self.db.get_instance(instance["id"]) or instance
+        return restart()
 
     def _write_config(
         self,
@@ -886,11 +1134,17 @@ class Provisioner:
         sync_interval_min: int = 0,
         sync_jitter_sec: int = 0,
         tls_skip_verify: bool = False,
+        folders: list[str] | None = None,
     ) -> None:
         if sync_interval_min <= 0:
             sync_interval_min = self.config.instance_sync_interval_min
         if sync_jitter_sec <= 0:
             sync_jitter_sec = self.config.instance_sync_jitter_sec
+        # Explicit selection > instance's stored selection > deployment default.
+        if folders is None:
+            folders = folders_from_instance(instance)
+        if folders is None:
+            folders = list(self.config.sync_folders)
         content = render_instance_config(
             email=instance["email"],
             settings=settings,
@@ -899,7 +1153,7 @@ class Provisioner:
             sync_interval_min=sync_interval_min,
             sync_jitter_sec=sync_jitter_sec,
             http_port=self.config.backend_port,
-            folders=self.config.sync_folders,
+            folders=folders,
             trash_folder=self.config.trash_folder,
             tls_skip_verify=tls_skip_verify,
         )
@@ -917,7 +1171,7 @@ class Provisioner:
             ) from exc
 
     def _wait_ready(
-        self, container_name: str, timeout: float = 45.0, *, host_port: int = 0
+        self, container_name: str, timeout: float = 120.0, *, host_port: int = 0
     ) -> str:
         deadline = time.monotonic() + timeout
         last_error = ""

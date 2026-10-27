@@ -121,6 +121,8 @@ class Config:
     invite_rate_window: int = 900
     provision_rate_limit: int = 8
     provision_rate_window: int = 3600
+    folders_rate_limit: int = 30
+    folders_rate_window: int = 900
     gateway_rate_limit: int = 120
     gateway_rate_window: int = 60
     gateway_timeout_seconds: int = 120
@@ -198,6 +200,8 @@ class Config:
             invite_rate_window=_env_int("MSM_INVITE_RATE_WINDOW", 900, 1),
             provision_rate_limit=_env_int("MSM_PROVISION_RATE_LIMIT", 8, 1),
             provision_rate_window=_env_int("MSM_PROVISION_RATE_WINDOW", 3600, 1),
+            folders_rate_limit=_env_int("MSM_FOLDERS_RATE_LIMIT", 30, 1),
+            folders_rate_window=_env_int("MSM_FOLDERS_RATE_WINDOW", 900, 1),
             gateway_rate_limit=_env_int("MSM_GATEWAY_RATE_LIMIT", 120, 1),
             gateway_rate_window=_env_int("MSM_GATEWAY_RATE_WINDOW", 60, 1),
             gateway_timeout_seconds=_env_int("MSM_GATEWAY_TIMEOUT", 120, 5),

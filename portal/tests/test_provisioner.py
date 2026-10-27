@@ -131,6 +131,99 @@ class ProvisionerTest(unittest.TestCase):
         self.assertEqual(second.token, first.token)
         self.assertEqual(second.instance["id"], first.instance["id"])
 
+    def test_folder_selection_is_rendered_and_reused(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision(
+            "user@gmail.com",
+            "abcd efgh",
+            folders=["INBOX", "已发送", "主送王星"],
+            invite_id="inv",
+        )
+        cfg = docker.configs[first.instance["config_volume"]]
+        self.assertIn('folders: ["INBOX", "已发送", "主送王星"]', cfg)
+        self.assertIn('idle_folders: ["INBOX"]', cfg)
+        self.assertEqual(
+            first.instance["folders"], '["INBOX", "已发送", "主送王星"]'
+        )
+
+        second = provisioner.provision(
+            "user@gmail.com",
+            "abcd efgh",
+            folders=["INBOX", "已发送", "主送王星"],
+        )
+        self.assertEqual(len(docker.runs), 1)
+        self.assertEqual(second.token, first.token)
+
+    def test_changing_folders_keeps_token_and_recreates(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision(
+            "user@gmail.com", "abcd efgh", folders=["INBOX"], invite_id="inv"
+        )
+        before = docker.configs[first.instance["config_volume"]]
+        self.assertIn('folders: ["INBOX"]', before)
+        self.assertEqual(len(docker.runs), 1)
+
+        second = provisioner.provision(
+            "user@gmail.com", "abcd efgh", folders=["INBOX", "Archive"]
+        )
+        self.assertTrue(second.reused)
+        self.assertFalse(second.rotated)
+        self.assertEqual(second.token, first.token)
+        self.assertEqual(len(docker.runs), 2)
+        after = docker.configs[first.instance["config_volume"]]
+        self.assertIn('folders: ["INBOX", "Archive"]', after)
+        self.assertNotEqual(before, after)
+        self.assertEqual(
+            self.db.get_instance(first.instance["id"])["folders"],
+            '["INBOX", "Archive"]',
+        )
+
+    def test_same_folders_in_different_order_do_not_recreate(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        first = provisioner.provision(
+            "user@gmail.com", "abcd efgh", folders=["INBOX", "Archive"], invite_id="inv"
+        )
+        self.assertEqual(len(docker.runs), 1)
+
+        second = provisioner.provision(
+            "user@gmail.com", "abcd efgh", folders=["Archive", "INBOX"]
+        )
+        self.assertEqual(second.token, first.token)
+        # Same set, different order: no container rebuild, no token change.
+        self.assertEqual(len(docker.runs), 1)
+
+    def test_folder_selection_all_folders_removes_restriction(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        result = provisioner.provision(
+            "user@gmail.com", "abcd efgh", folders=[], invite_id="inv"
+        )
+        cfg = docker.configs[result.instance["config_volume"]]
+        self.assertNotIn("folders:", cfg)
+        self.assertEqual(result.instance["folders"], "[]")
+
+    def test_no_folder_picker_keeps_deployment_default(self) -> None:
+        _, docker, _, provisioner = self._provisioner()
+        result = provisioner.provision("user@gmail.com", "abcd efgh", invite_id="inv")
+        cfg = docker.configs[result.instance["config_volume"]]
+        self.assertIn('folders: ["INBOX"]', cfg)
+        self.assertIsNone(result.instance["folders"])
+
+    def test_folder_selection_rejects_oversized_name(self) -> None:
+        _, _, _, provisioner = self._provisioner()
+        with self.assertRaises(ProvisionError) as ctx:
+            provisioner.provision(
+                "user@gmail.com", "abcd efgh", folders=["x" * 300]
+            )
+        self.assertEqual(ctx.exception.field, "folders")
+
+    def test_list_mailbox_folders_returns_imap_list(self) -> None:
+        _, _, _, provisioner = self._provisioner()
+        provisioner._list_folders = lambda settings, password: ["INBOX", "已发送"]
+        self.assertEqual(
+            provisioner.list_mailbox_folders("user@gmail.com", "abcd efgh"),
+            ["INBOX", "已发送"],
+        )
+
     def test_foreign_invite_with_bad_password_does_not_transfer_owner(self) -> None:
         _, docker, _, provisioner = self._provisioner()
         first = provisioner.provision("user@gmail.com", "old-password", invite_id="inv-a")

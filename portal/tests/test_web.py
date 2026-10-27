@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import os
 import re
 import tempfile
@@ -40,6 +41,9 @@ class FakeProvisioner:
         self.instance_id = instance_id
         self.token = "test-token-abcdefghijklmnopqrstuvwxyz"
         self.calls: list[dict] = []
+        self.folder_calls: list[dict] = []
+        self.folders: list[str] = ["INBOX"]
+        self.folder_error: ProvisionError | None = None
         self.db.insert_instance(
             {
                 "id": instance_id,
@@ -71,6 +75,12 @@ class FakeProvisioner:
             reused=len(self.calls) > 1,
             rotated=False,
         )
+
+    def list_mailbox_folders(self, email, password, **kwargs):
+        self.folder_calls.append({"email": email, "password": password, **kwargs})
+        if self.folder_error is not None:
+            raise self.folder_error
+        return list(self.folders)
 
 
 class RaisingProvisioner:
@@ -232,6 +242,113 @@ class WebAppTest(unittest.TestCase):
         status, _, data = self.client.get(headers["location"])
         self.assertIn("已找到现有实例", data.decode("utf-8"))
         self.assertEqual(len(self.provisioner.calls), 2)
+
+    def test_folders_endpoint_returns_imap_list(self) -> None:
+        self._make_invite()
+        self._enter()
+        csrf = self._csrf()
+        self.provisioner.folders = ["INBOX", "已发送", "主送王星"]
+        status, _, data = self.client.post_form(
+            "/folders",
+            {
+                "csrf": csrf,
+                "email": "user@example.com",
+                "password": "pw",
+                "host": "",
+                "port": "",
+                "tls_mode": "tls",
+                "provider": "auto",
+            },
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(data.decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["folders"], ["INBOX", "已发送", "主送王星"])
+        self.assertEqual(payload["count"], 3)
+        self.assertIn("elapsed_ms", payload)
+        self.assertEqual(self.provisioner.folder_calls[0]["email"], "user@example.com")
+
+    def test_folders_endpoint_requires_csrf(self) -> None:
+        self._make_invite()
+        self._enter()
+        status, _, _ = self.client.post_form(
+            "/folders", {"email": "user@example.com", "password": "pw"}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(self.provisioner.folder_calls, [])
+
+    def test_folders_endpoint_requires_session(self) -> None:
+        status, _, _ = self.client.post_form(
+            "/folders", {"email": "user@example.com", "password": "pw"}
+        )
+        self.assertEqual(status, 401)
+
+    def test_provision_passes_selected_folders(self) -> None:
+        self._make_invite()
+        self._enter()
+        csrf = self._csrf()
+        body = urlencode(
+            [
+                ("csrf", csrf),
+                ("email", "user@example.com"),
+                ("password", "pw"),
+                ("folders_used", "1"),
+                ("folders", "INBOX"),
+                ("folders", "已发送"),
+            ]
+        ).encode("utf-8")
+        status, _, _ = self.client.request(
+            "POST",
+            "/provision",
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.provisioner.calls[0]["folders"], ["INBOX", "已发送"])
+
+    def test_provision_without_picker_sends_none(self) -> None:
+        self._make_invite()
+        self._enter()
+        csrf = self._csrf()
+        status, _, _ = self.client.post_form(
+            "/provision",
+            {"csrf": csrf, "email": "user@example.com", "password": "pw"},
+        )
+        self.assertEqual(status, 303)
+        self.assertIsNone(self.provisioner.calls[0]["folders"])
+
+    def test_provision_rejects_empty_picker_selection(self) -> None:
+        self._make_invite()
+        self._enter()
+        csrf = self._csrf()
+        status, _, data = self.client.post_form(
+            "/provision",
+            {
+                "csrf": csrf,
+                "email": "user@example.com",
+                "password": "pw",
+                "folders_used": "1",
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(self.provisioner.calls, [])
+        self.assertIn("至少选择一个", data.decode("utf-8"))
+
+    def test_provision_all_folders_mode(self) -> None:
+        self._make_invite()
+        self._enter()
+        csrf = self._csrf()
+        status, _, _ = self.client.post_form(
+            "/provision",
+            {
+                "csrf": csrf,
+                "email": "user@example.com",
+                "password": "pw",
+                "folders_mode": "all",
+            },
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.provisioner.calls[0]["folders"], [])
 
     def test_provision_requires_csrf(self) -> None:
         self._make_invite()
