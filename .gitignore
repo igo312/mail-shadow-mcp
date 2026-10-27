@@ -1,5 +1,8 @@
 # Runtime data — never commit
 /data/*.db
+# Docker data-root + containerd root live on the data disk inside this dir
+/data/docker/
+/data/containerd/
 
 # AI agent memory — local only
 /memory-bank/
@@ -11,3 +14,8 @@ config.yaml
 /dist/
 /mail-shadow-mcp
 /mail-shadow-mcp.exe
+
+# Local scratch (backups, ad-hoc scripts, test harnesses)
+/.tmp/
+/portal/.tmp-*.py
+/AGENTS.md
